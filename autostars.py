@@ -57,12 +57,12 @@ except Exception as e:  # noqa: BLE001
 # ============================== МЕТА-ДАННЫЕ ПЛАГИНА ==============================
 
 NAME = "AutoStars"
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 DESCRIPTION = (
     "Автовыдача Telegram Stars: покупка звёзд через Fragment и оплата с "
     "TON-кошелька (Wallet V5R1). Требует: pip install pytoniq."
 )
-CREDITS = "@autostars"
+CREDITS = "@vipzazaa"
 UUID = "75645030-dcb7-4d15-881d-efae51369c14"
 SETTINGS_PAGE = True
 
@@ -89,6 +89,8 @@ DEFAULT_CONFIG = {
     "show_ad": False,
     "refund_on_error": False,
     "loop_interval_sec": 5,
+    "low_balance_threshold": 0.0,
+    "low_balance_notify": True,
     "review_reply": True,
     "review_reply_text": "🌟 Спасибо за отзыв!",
     "messages": {
@@ -552,6 +554,9 @@ class AutoStarsService:
         self._loop_busy = False
         self._checking = set()
         self._stop = threading.Event()
+        self._low_balance_paused = False
+        self._bot = None
+        self._admin_chat_id: int | None = None
         self._thread = threading.Thread(target=self._loop, daemon=True, name="AutoStarsLoop")
         self._thread.start()
         logger.info(f"{LOGGER_PREFIX} Сервис запущен.")
@@ -702,6 +707,17 @@ class AutoStarsService:
                 continue
             self._loop_busy = True
             try:
+                # Проверяем баланс на пороговое значение до обработки заказов.
+                # Если включён low_balance_threshold или цикл уже на паузе — делаем запрос.
+                if float(self.config.get("low_balance_threshold", 0)) > 0 or self._low_balance_paused:
+                    try:
+                        bal = self.wallet.get_balance()
+                        if self._check_low_balance(bal):
+                            continue
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning(f"{LOGGER_PREFIX} Не удалось проверить баланс: {e}")
+                        if self._low_balance_paused:
+                            continue
                 orders = self.storage.get_ready_orders()
                 if not orders:
                     continue
@@ -827,6 +843,65 @@ class AutoStarsService:
                 time.sleep(1)
         order["status"] = old_status
         self.storage.upsert(order)
+
+    # ---------- автовыключение при низком балансе ----------
+
+    def _check_low_balance(self, balance_nanoton: int) -> bool:
+        """Возвращает True и приостанавливает цикл, если баланс ниже порога."""
+        threshold = float(self.config.get("low_balance_threshold", 0))
+        if threshold <= 0:
+            if self._low_balance_paused:
+                self._low_balance_paused = False
+            return False
+        if balance_nanoton < int(threshold * ONE_TON):
+            if not self._low_balance_paused:
+                self._low_balance_paused = True
+                logger.warning(
+                    f"{LOGGER_PREFIX} Низкий баланс: {balance_nanoton / ONE_TON:.4f} TON "
+                    f"(порог {threshold} TON). Автовыдача приостановлена."
+                )
+                self._notify_low_balance(balance_nanoton, threshold)
+            return True
+        if self._low_balance_paused:
+            self._low_balance_paused = False
+            logger.info(
+                f"{LOGGER_PREFIX} Баланс восстановлен: {balance_nanoton / ONE_TON:.4f} TON. "
+                f"Автовыдача возобновлена."
+            )
+            self._notify_balance_ok(balance_nanoton)
+        return False
+
+    def _notify_low_balance(self, balance: int, threshold: float) -> None:
+        if not self.config.get("low_balance_notify", True):
+            return
+        if not self._bot or not self._admin_chat_id:
+            return
+        try:
+            self._bot.send_message(
+                self._admin_chat_id,
+                f"⚠️ <b>AutoStars: низкий баланс!</b>\n\n"
+                f"Текущий баланс: <b>{balance / ONE_TON:.4f} TON</b>\n"
+                f"Порог: <b>{threshold} TON</b>\n\n"
+                f"Автовыдача <b>приостановлена</b>. Пополните кошелёк — "
+                f"плагин возобновит работу автоматически."
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"{LOGGER_PREFIX} Не удалось уведомить о низком балансе: {e}")
+
+    def _notify_balance_ok(self, balance: int) -> None:
+        if not self.config.get("low_balance_notify", True):
+            return
+        if not self._bot or not self._admin_chat_id:
+            return
+        try:
+            self._bot.send_message(
+                self._admin_chat_id,
+                f"✅ <b>AutoStars: баланс восстановлен!</b>\n\n"
+                f"Текущий баланс: <b>{balance / ONE_TON:.4f} TON</b>\n\n"
+                f"Автовыдача <b>возобновлена</b>."
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"{LOGGER_PREFIX} Не удалось уведомить о восстановлении баланса: {e}")
 
     def reload_providers(self) -> str:
         """Пересоздаёт Fragment/кошелёк/tonapi по текущему конфигу. Возвращает статус-текст."""
@@ -954,6 +1029,12 @@ def register_settings(cardinal: "Cardinal", *args) -> None:
                  callback_data=f"astgl:refund_on_error:{offset}"))
         kb.add(B(f"⏱ Интервал цикла: {cfg.get('loop_interval_sec', 5)} сек",
                  callback_data=f"asedit:loop_interval_sec:{offset}"))
+        lbt = cfg.get("low_balance_threshold", 0.0)
+        lbt_label = f"{lbt} TON" if lbt else "выкл"
+        kb.add(B(f"🪫 Мин. баланс: {lbt_label}",
+                 callback_data=f"asedit:low_balance_threshold:{offset}"))
+        kb.add(B(f"🔔 Уведомить о низком балансе: {on_off(cfg.get('low_balance_notify', True))}",
+                 callback_data=f"astgl:low_balance_notify:{offset}"))
         kb.add(B(f"📝 Ответ на отзыв: {on_off(cfg.get('review_reply'))}",
                  callback_data=f"astgl:review_reply:{offset}"))
         kb.add(B("📝 Текст ответа на отзыв", callback_data=f"asedit:review_reply_text:{offset}"))
@@ -968,14 +1049,16 @@ def register_settings(cardinal: "Cardinal", *args) -> None:
         if SERVICE is not None:
             fr = "✅" if SERVICE.fragment else "❌"
             wl = "✅" if SERVICE.wallet else "❌"
-            status = f"Fragment {fr} · Кошелёк {wl}"
+            pause = " · ⏸ пауза: низкий баланс" if SERVICE._low_balance_paused else ""
+            status = f"Fragment {fr} · Кошелёк {wl}{pause}"
         elif not PYTONIQ_AVAILABLE:
             status = "❌ не установлен pytoniq (pip install pytoniq)"
         return (f"<b>⭐ AutoStars — настройки</b>\n\n"
                 f"<i>Состояние:</i> {status}\n\n"
                 f"Нажмите на пункт, чтобы изменить. Секретные значения "
                 f"(cookies, hash, сид-фраза) скрыты и показываются как «задано».\n"
-                f"После изменения ключей нажмите «♻️ Переподключить».")
+                f"После изменения ключей нажмите «♻️ Переподключить».\n"
+                f"Мин. баланс = 0 → автовыключение отключено.")
 
     def render(c, offset: int) -> None:
         bot.edit_message_text(settings_text(), c.message.chat.id, c.message.id,
@@ -994,6 +1077,9 @@ def register_settings(cardinal: "Cardinal", *args) -> None:
         # Открытие из меню плагина (47:UUID:offset) или возврат (asopen:offset).
         parts = c.data.split(":")
         offset = int(parts[-1]) if parts[-1].lstrip("-").isdigit() else 0
+        if SERVICE is not None:
+            SERVICE._bot = bot
+            SERVICE._admin_chat_id = c.message.chat.id
         render(c, offset)
         bot.answer_callback_query(c.id)
 
@@ -1077,6 +1163,17 @@ def register_settings(cardinal: "Cardinal", *args) -> None:
                 cfg[key] = max(2, int(value))
             except ValueError:
                 bot.reply_to(m, "❌ Нужно число (секунды).",
+                             reply_markup=K().add(B("◀️ К настройкам",
+                                                    callback_data=f"asopen:{offset}")))
+                return
+        elif key == "low_balance_threshold":
+            try:
+                val = float(value.replace(",", "."))
+                if val < 0:
+                    raise ValueError
+                cfg[key] = val
+            except ValueError:
+                bot.reply_to(m, "❌ Нужно число ≥ 0 (например: 1.5). 0 — отключить.",
                              reply_markup=K().add(B("◀️ К настройкам",
                                                     callback_data=f"asopen:{offset}")))
                 return
