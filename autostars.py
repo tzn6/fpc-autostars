@@ -388,11 +388,23 @@ class Wallet:
         return int(self.tonapi.get_wallet(self.address)["balance"])
 
     def transfer(self, transfers: list[dict], wait_seconds: int = 60) -> dict:
-        seqno = self.tonapi.get_seqno(self.address)
-        boc, in_hash = self.offline.build_external_transfer(seqno, transfers)
-        self.tonapi.send_boc(boc)
-        tx = self.tonapi.wait_for_transfer(in_hash, int(time.time() + wait_seconds))
-        return {"hash": tx["hash"], "in_msg_hash": in_hash}
+        deadline = int(time.time() + wait_seconds)
+        last_err = None
+        for attempt in range(3):
+            seqno = self.tonapi.get_seqno(self.address)
+            boc, in_hash = self.offline.build_external_transfer(seqno, transfers)
+            try:
+                self.tonapi.send_boc(boc)
+            except TonAPIError as e:
+                last_err = e
+                if "seqno" in str(e).lower() and attempt < 2:
+                    logger.warning(f"{LOGGER_PREFIX} Устаревший seqno ({seqno}), повтор через 2с…")
+                    time.sleep(2)
+                    continue
+                raise
+            tx = self.tonapi.wait_for_transfer(in_hash, deadline)
+            return {"hash": tx["hash"], "in_msg_hash": in_hash}
+        raise last_err or TonAPIError("transfer failed")
 
 
 # ============================== Хранилище заказов ==============================
