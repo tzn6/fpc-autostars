@@ -390,16 +390,20 @@ class Wallet:
     def transfer(self, transfers: list[dict], wait_seconds: int = 60) -> dict:
         deadline = int(time.time() + wait_seconds)
         last_err = None
-        for attempt in range(3):
+        for attempt in range(8):
             seqno = self.tonapi.get_seqno(self.address)
             boc, in_hash = self.offline.build_external_transfer(seqno, transfers)
             try:
                 self.tonapi.send_boc(boc)
             except TonAPIError as e:
                 last_err = e
-                if "seqno" in str(e).lower() and attempt < 2:
-                    logger.warning(f"{LOGGER_PREFIX} Устаревший seqno ({seqno}), повтор через 2с…")
-                    time.sleep(2)
+                if "seqno" in str(e).lower() and attempt < 7:
+                    wait = min(5 * (attempt + 1), 30)
+                    logger.warning(
+                        f"{LOGGER_PREFIX} Устаревший seqno ({seqno}), "
+                        f"попытка {attempt + 1}/8, повтор через {wait}с…"
+                    )
+                    time.sleep(wait)
                     continue
                 raise
             tx = self.tonapi.wait_for_transfer(in_hash, deadline)
