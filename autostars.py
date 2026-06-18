@@ -371,6 +371,9 @@ class Wallet:
     def __init__(self, offline: OfflineWallet, tonapi: TonAPI):
         self.offline = offline
         self.tonapi = tonapi
+        # Локально отслеживаем минимально ожидаемый seqno.
+        # tonapi иногда кэширует устаревшее значение — используем max().
+        self._min_seqno: int = 0
 
     @classmethod
     def from_mnemonic(cls, mnemonic: str, tonapi: TonAPI) -> "Wallet":
@@ -389,26 +392,21 @@ class Wallet:
 
     def transfer(self, transfers: list[dict], wait_seconds: int = 60) -> dict:
         deadline = int(time.time() + wait_seconds)
-        last_err = None
-        for attempt in range(8):
-            seqno = self.tonapi.get_seqno(self.address)
-            boc, in_hash = self.offline.build_external_transfer(seqno, transfers)
-            try:
-                self.tonapi.send_boc(boc)
-            except TonAPIError as e:
-                last_err = e
-                if "seqno" in str(e).lower() and attempt < 7:
-                    wait = min(5 * (attempt + 1), 30)
-                    logger.warning(
-                        f"{LOGGER_PREFIX} Устаревший seqno ({seqno}), "
-                        f"попытка {attempt + 1}/8, повтор через {wait}с…"
-                    )
-                    time.sleep(wait)
-                    continue
-                raise
-            tx = self.tonapi.wait_for_transfer(in_hash, deadline)
-            return {"hash": tx["hash"], "in_msg_hash": in_hash}
-        raise last_err or TonAPIError("transfer failed")
+        # Берём максимум: tonapi может вернуть устаревшее значение,
+        # но мы точно знаем что следующий seqno не меньше _min_seqno.
+        tonapi_seqno = self.tonapi.get_seqno(self.address)
+        seqno = max(tonapi_seqno, self._min_seqno)
+        if seqno != tonapi_seqno:
+            logger.warning(
+                f"{LOGGER_PREFIX} tonapi вернул устаревший seqno {tonapi_seqno}, "
+                f"используем локальный {seqno}."
+            )
+        boc, in_hash = self.offline.build_external_transfer(seqno, transfers)
+        self.tonapi.send_boc(boc)
+        tx = self.tonapi.wait_for_transfer(in_hash, deadline)
+        # Фиксируем следующий ожидаемый seqno.
+        self._min_seqno = seqno + 1
+        return {"hash": tx["hash"], "in_msg_hash": in_hash}
 
 
 # ============================== Хранилище заказов ==============================
