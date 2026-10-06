@@ -1,4 +1,4 @@
-"""Payment recovery tests. Network requests and TON signing are always simulated."""
+"""Plugin tests. Network requests and TON signing are always simulated."""
 import base64
 import copy
 import hashlib
@@ -137,6 +137,13 @@ class FakeFragment:
         self.calls = []
         self.broken = False
         self.multiple_messages = False
+        self.lookups = []
+
+    def search_stars_recipient(self, username):
+        self.lookups.append(username)
+        if username == "wronguser":
+            raise p.FragmentError("searchStarsRecipient", "No Telegram users found.")
+        return {"recipient": "recipient:" + username}
 
     def init_buy_stars_request(self, recipient, quantity):
         self.calls.append((recipient, quantity))
@@ -181,6 +188,14 @@ class Ticks:
             self.left -= 1
         else:
             self.stopped = True
+
+
+class ImmediateThread:
+    def __init__(self, target, args=(), **kwargs):
+        self.target, self.args = target, args
+
+    def start(self):
+        self.target(*self.args)
 
 
 def order(order_id="O1"):
@@ -589,6 +604,318 @@ class PaymentTests(unittest.TestCase):
         ready = self.s.storage.get_ready_orders()
         ready[0]["status"] = p.ST_DONE
         self.assertEqual(self.s.storage.get("O1")["status"], p.ST_READY)
+
+    def waiting_order(self, order_id="O1", username="wronguser"):
+        waiting = order(order_id)
+        waiting.update(status=p.ST_WAITING_USERNAME, error=p.ERR_USERNAME_NOT_FOUND,
+                       telegram_username=username, recipient_id=None, chat_id="users-2-999")
+        self.s.storage.upsert(waiting)
+        return waiting
+
+    def buyer_message(self, text, message_id=100, author_id=2):
+        return types.SimpleNamespace(id=message_id, author_id=author_id, author="buyer",
+                                     chat_id=12345, text=text)
+
+    def command(self, text="/stars @correct_user", message_id=100, author_id=2):
+        message = self.buyer_message(text, message_id, author_id)
+        with mock.patch.object(p.threading, "Thread", ImmediateThread):
+            self.s.handle_new_message(message)
+        return message
+
+    def test_corrected_username_order_is_paid_once(self):
+        initial = order()
+        initial.update(status=p.ST_UNPROCESSED, telegram_username="wronguser", recipient_id=None)
+        self.s.storage.upsert(initial)
+        self.s._check_username(initial)
+        self.assertEqual(self.s.storage.get("O1")["status"], p.ST_WAITING_USERNAME)
+        self.assertIn("/stars", self.s.cardinal.messages[-1][1])
+        with mock.patch.object(p, "SERVICE", self.s), \
+             mock.patch.object(p.threading, "Thread", ImmediateThread):
+            p.on_new_message(self.s.cardinal, types.SimpleNamespace(
+                message=self.buyer_message("/stars @correct_user")))
+        saved = self.s.storage.get("O1")
+        self.assertEqual(saved["status"], p.ST_READY)
+        self.assertEqual(saved["recipient_id"], "recipient:correct_user")
+        self.assertEqual(saved["chat_id"], 12345)
+        self.assertIn("принят", self.s.cardinal.messages[-1][1])
+        self.run_cycles(3)
+        self.assertEqual(self.s.storage.get("O1")["status"], p.ST_DONE)
+        self.assertEqual(self.s.fragment.calls, [("recipient:correct_user", 50)])
+        self.assertEqual(len(self.s.tonapi.broadcasts), 1)
+        self.assertIn("@correct_user", self.s.cardinal.messages[-1][1])
+
+    def test_command_variants_and_links_are_recognized(self):
+        for text in ("/stars correct_user", "/STARS @correct_user", "!stars @correct_user",
+                     "/stars\n@correct_user", "/stars\u200b\u00a0@correct_user",
+                     "/stars https://t.me/correct_user", "https://telegram.me/correct_user/",
+                     "@correct_user", "correct_user"):
+            with self.subTest(text=text):
+                self.s = self.service()
+                self.s.storage.orders = {}
+                self.waiting_order()
+                self.command(text)
+                self.assertEqual(self.s.storage.get("O1")["status"], p.ST_READY)
+                self.assertEqual(self.s.fragment.lookups, ["correct_user"])
+                self.assertIn("принят", self.s.cardinal.messages[-1][1])
+
+    def test_bad_command_arguments_get_help_without_partial_username(self):
+        for text in ("/stars", "/stars @ab", "/stars @valid-user", "/stars @user.name",
+                     "/stars " + "a" * 33, "/stars @correct_user extra",
+                     "/stars https://t.me/correct_user/123", "/stars @user🙂"):
+            with self.subTest(text=text):
+                self.s = self.service()
+                self.s.storage.orders = {}
+                self.waiting_order()
+                before = self.s.storage.get("O1")
+                self.command(text)
+                self.assertEqual(self.s.storage.get("O1"), before)
+                self.assertEqual(self.s.fragment.lookups, [])
+                self.assertIn("/stars @", self.s.cardinal.messages[-1][1])
+
+    def test_other_commands_and_normal_text_are_ignored(self):
+        self.waiting_order()
+        before = self.s.storage.get("O1")
+        for text in ("/starsmore correct_user", "/start @correct_user", "добрый день"):
+            self.command(text)
+        self.assertEqual(self.s.storage.get("O1"), before)
+        self.assertEqual(self.s.cardinal.messages, [])
+
+    def test_username_correction_during_lookup_uses_latest_answer(self):
+        initial = self.waiting_order(username="old_user")
+        entered, resume = threading.Event(), threading.Event()
+        original = self.s.fragment.search_stars_recipient
+
+        def slow_search(username):
+            if username == "old_user":
+                entered.set()
+                if not resume.wait(3):
+                    raise AssertionError("test did not release lookup")
+            return original(username)
+
+        self.s.fragment.search_stars_recipient = slow_search
+        worker = threading.Thread(target=self.s._check_username, args=(initial,))
+        worker.start()
+        self.addCleanup(resume.set)
+        try:
+            self.assertTrue(entered.wait(3))
+            self.command("/stars @intermediate_user", message_id=100)
+            self.command("/stars @correct_user", message_id=101)
+            self.assertIn("принят", self.s.cardinal.messages[-1][1])
+        finally:
+            resume.set()
+            worker.join(3)
+        self.assertFalse(worker.is_alive())
+        saved = self.s.storage.get("O1")
+        self.assertEqual(saved["status"], p.ST_READY)
+        self.assertEqual(saved["telegram_username"], "correct_user")
+        self.assertEqual(saved["recipient_id"], "recipient:correct_user")
+        self.assertEqual(self.s.fragment.lookups, ["old_user", "correct_user"])
+        self.assertEqual(self.s._checking, set())
+
+    def test_answer_while_error_hint_is_sending_is_not_dropped(self):
+        initial = self.waiting_order(username="bad-user")
+        original = self.s.cardinal.send_message
+        replied = False
+
+        def send(chat_id, text, buyer_name):
+            nonlocal replied
+            original(chat_id, text, buyer_name)
+            if "/stars" in text and not replied:
+                replied = True
+                self.command()
+
+        self.s.cardinal.send_message = send
+        self.s._check_username(initial)
+        self.assertTrue(replied)
+        self.assertEqual(self.s.storage.get("O1")["status"], p.ST_READY)
+        self.assertEqual(self.s.storage.get("O1")["telegram_username"], "correct_user")
+
+    def test_command_arriving_before_initial_check_is_accepted(self):
+        initial = self.waiting_order()
+        initial["status"] = p.ST_UNPROCESSED
+        self.s.storage.upsert(initial)
+        self.command()
+        self.assertEqual(self.s.storage.get("O1")["status"], p.ST_READY)
+        self.assertEqual(self.s.fragment.lookups, ["correct_user"])
+
+    def test_seller_and_system_messages_do_not_change_recipient(self):
+        self.waiting_order()
+        before = self.s.storage.get("O1")
+        for author_id in (999, "999", 0, "0", None):
+            self.command(author_id=author_id)
+        self.assertEqual(self.s.storage.get("O1"), before)
+        self.assertEqual(self.s.cardinal.messages, [])
+
+    def test_another_author_cannot_change_buyer_order_by_chat(self):
+        waiting = self.waiting_order()
+        waiting["chat_id"] = 12345
+        self.s.storage.upsert(waiting)
+        self.command(author_id=3)
+        self.assertEqual(self.s.storage.get("O1"), waiting)
+        self.assertEqual(self.s.fragment.lookups, [])
+
+    def test_string_buyer_id_matches_and_chat_node_is_updated(self):
+        self.waiting_order()
+        self.command(author_id="2")
+        saved = self.s.storage.get("O1")
+        self.assertEqual(saved["status"], p.ST_READY)
+        self.assertEqual(saved["chat_id"], 12345)
+
+    def test_paid_ready_refunded_and_review_orders_cannot_be_changed(self):
+        for status in (p.ST_READY, p.ST_TRANSFERRING, p.ST_DONE, p.ST_REFUNDED,
+                       p.ST_REFUND_PENDING, p.ST_NEEDS_REVIEW):
+            with self.subTest(status=status):
+                self.s = self.service()
+                self.s.storage.orders = {}
+                current = order()
+                current["status"] = status
+                self.s.storage.upsert(current)
+                self.command()
+                self.assertEqual(self.s.storage.get("O1"), current)
+                self.assertEqual(self.s.fragment.lookups, [])
+                self.assertIn("Нет заказа", self.s.cardinal.messages[-1][1])
+
+    def test_pending_payment_guard_blocks_waiting_status(self):
+        waiting = self.waiting_order()
+        waiting["payment_attempt"] = {"state": "PENDING"}
+        self.s.storage.upsert(waiting)
+        self.command()
+        self.assertEqual(self.s.storage.get("O1"), waiting)
+        self.s._check_username(waiting)
+        self.assertEqual(self.s.fragment.lookups, [])
+
+    def test_multiple_orders_require_explicit_choice(self):
+        one, two = self.waiting_order("O1"), self.waiting_order("O2")
+        self.command()
+        self.assertEqual(self.s.storage.get("O1"), one)
+        self.assertEqual(self.s.storage.get("O2"), two)
+        self.assertIn("O1, O2", self.s.cardinal.messages[-1][1])
+        self.command("/stars #o2 @correct_user", message_id=101)
+        self.assertEqual(self.s.storage.get("O1"), one)
+        self.assertEqual(self.s.storage.get("O2")["status"], p.ST_READY)
+
+    def test_order_selector_cannot_access_another_buyers_order(self):
+        one, two = self.waiting_order("O1"), self.waiting_order("O2")
+        two["buyer_id"] = 3
+        self.s.storage.upsert(two)
+        self.command("/stars O2 @correct_user")
+        self.assertEqual(self.s.storage.get("O1"), one)
+        self.assertEqual(self.s.storage.get("O2"), two)
+        self.assertEqual(self.s.fragment.lookups, [])
+
+    def test_duplicate_and_older_messages_do_not_repeat_checks(self):
+        self.waiting_order()
+        self.command("/stars @wronguser", message_id=101)
+        before = self.s.storage.get("O1")
+        messages = len(self.s.cardinal.messages)
+        self.command("/stars @wronguser", message_id=101)
+        self.command("/stars @other_user", message_id=100)
+        self.assertEqual(self.s.storage.get("O1"), before)
+        self.assertEqual(self.s.fragment.lookups, ["wronguser"])
+        self.assertEqual(len(self.s.cardinal.messages), messages)
+        self.command("/stars @correct_user", message_id=102)
+        self.assertEqual(self.s.storage.get("O1")["status"], p.ST_READY)
+
+    def test_old_mode_command_reads_real_message_and_checks_buyer(self):
+        self.waiting_order()
+        self.s.cardinal.old_mode_enabled = True
+        self.s.cardinal.account.get_chat_history = mock.Mock(return_value=[
+            self.buyer_message("/stars @other_user", message_id=99),
+            self.buyer_message("/stars @correct_user", message_id=100)])
+        chat = types.SimpleNamespace(id=12345, node_msg_id=100,
+                                     last_message_text="/stars @correct_user", unread=False)
+        with mock.patch.object(p, "SERVICE", self.s), \
+             mock.patch.object(p.threading, "Thread", ImmediateThread):
+            p.on_last_chat_message_changed(self.s.cardinal, types.SimpleNamespace(chat=chat))
+        self.s.cardinal.account.get_chat_history.assert_called_once_with(12345)
+        self.assertEqual(self.s.storage.get("O1")["status"], p.ST_READY)
+        self.assertEqual(self.s.fragment.lookups, ["correct_user"])
+        self.assertIn(p.on_last_chat_message_changed, p.BIND_TO_LAST_CHAT_MESSAGE_CHANGED)
+
+    def test_old_mode_never_uses_unread_flag_as_author_identity(self):
+        self.waiting_order()
+        before = self.s.storage.get("O1")
+        self.s.cardinal.account.get_chat_history = mock.Mock(return_value=[
+            self.buyer_message("/stars @correct_user", author_id="999")])
+        chat = types.SimpleNamespace(id=12345, node_msg_id=100,
+                                     last_message_text="/stars @correct_user", unread=True)
+        with mock.patch.object(p.threading, "Thread", ImmediateThread):
+            self.s.handle_last_chat_message(chat)
+        self.assertEqual(self.s.storage.get("O1"), before)
+        self.assertEqual(self.s.cardinal.messages, [])
+
+    def test_new_mode_does_not_process_chat_shortcut_again(self):
+        self.s.cardinal.old_mode_enabled = False
+        self.s.cardinal.account.get_chat_history = mock.Mock()
+        with mock.patch.object(p, "SERVICE", self.s):
+            p.on_last_chat_message_changed(self.s.cardinal, types.SimpleNamespace(chat=None))
+        self.s.cardinal.account.get_chat_history.assert_not_called()
+
+    def test_old_mode_plain_username_is_checked_for_waiting_buyer(self):
+        self.waiting_order()
+        self.s.cardinal.account.get_chat_history = mock.Mock(return_value=[
+            self.buyer_message("@correct_user")])
+        chat = types.SimpleNamespace(id=12345, name="BUYER", node_msg_id=100,
+                                     last_message_text="@correct_user")
+        with mock.patch.object(p.threading, "Thread", ImmediateThread):
+            self.s.handle_last_chat_message(chat)
+        self.assertEqual(self.s.storage.get("O1")["status"], p.ST_READY)
+
+    def test_old_mode_normal_text_without_waiting_order_avoids_history_request(self):
+        self.waiting_order()
+        self.s.cardinal.account.get_chat_history = mock.Mock()
+        chat = types.SimpleNamespace(id=67890, name="someone_else", node_msg_id=100,
+                                     last_message_text="hello")
+        self.s.handle_last_chat_message(chat)
+        self.s.cardinal.account.get_chat_history.assert_not_called()
+
+    def test_old_mode_history_error_keeps_order_unchanged(self):
+        self.waiting_order()
+        before = self.s.storage.get("O1")
+        self.s.cardinal.account.get_chat_history = mock.Mock(side_effect=TimeoutError("offline"))
+        chat = types.SimpleNamespace(id=12345, node_msg_id=100, last_message_text="/stars @correct_user")
+        with mock.patch.object(p.threading, "Thread", ImmediateThread):
+            self.s.handle_last_chat_message(chat)
+        self.assertEqual(self.s.storage.get("O1"), before)
+        self.assertEqual(self.s.fragment.lookups, [])
+
+    def test_command_without_waiting_order_gets_reply(self):
+        self.command()
+        self.assertEqual(self.s.storage.orders, {})
+        self.assertIn("Нет заказа", self.s.cardinal.messages[-1][1])
+
+    def test_order_description_never_uses_category_as_username(self):
+        for tail in ("@bad-user", "bad.user", "@ab", "a" * 33, "", "По username"):
+            with self.subTest(tail=tail):
+                self.assertIsNone(p.extract_username("Telegram, 50 Stars, По username, " + tail))
+        for tail in ("correct_user", "@correct_user", "https://t.me/correct_user"):
+            self.assertEqual(p.extract_username("Telegram, 50 Stars, По username, " + tail), "correct_user")
+
+    def test_accepted_username_survives_write_before_worker_start(self):
+        self.waiting_order()
+        with mock.patch.object(p.threading, "Thread"):
+            self.s.handle_new_message(self.buyer_message("/stars @correct_user"))
+        restored = p.Storage(self.path)
+        unchecked = restored.get_unchecked_orders()
+        self.assertEqual([o["telegram_username"] for o in unchecked], ["correct_user"])
+        with mock.patch.object(p, "Storage", return_value=restored), \
+             mock.patch.object(p, "TonAPI", return_value=self.s.tonapi), \
+             mock.patch.object(p.threading, "Thread") as threads:
+            restarted = p.AutoStarsService(self.s.cardinal, self.s.config)
+        username_workers = [c for c in threads.call_args_list
+                            if c.kwargs.get("target") == restarted._check_username]
+        self.assertEqual(len(username_workers), 1)
+        restarted.fragment = self.s.fragment
+        restarted._check_username(unchecked[0])
+        self.assertEqual(restored.get("O1")["status"], p.ST_READY)
+
+    def test_unchecked_orders_exclude_failed_checks_and_pending_payments(self):
+        self.waiting_order("O1")
+        pending = self.waiting_order("O2")
+        pending["error"] = None
+        pending["payment_attempt"] = {"state": "PENDING"}
+        self.s.storage.upsert(pending)
+        self.assertEqual(self.s.storage.get_unchecked_orders(), [])
 
 
 if __name__ == "__main__":

@@ -60,7 +60,7 @@ except Exception as e:  # noqa: BLE001
 # ============================== МЕТА-ДАННЫЕ ПЛАГИНА ==============================
 
 NAME = "AutoStars"
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 DESCRIPTION = (
     "Автовыдача Telegram Stars: покупка звёзд через Fragment и оплата с "
     "TON-кошелька W5. Требует: pip install pytoniq."
@@ -107,6 +107,10 @@ DEFAULT_CONFIG = {
         "not_user_username": "❌ {buyer}, telegram тег @{username} принадлежит не пользователю.\nПеревод звёзд каналам/чатам не поддерживается.\n\nУкажите юзернейм пользователя:\n/stars ваш_телеграм_юзернейм",
         "blocked_by_user": "❌ {buyer}, похоже, вы заблокировали мой Telegram аккаунт, поэтому я не могу перевести звёзды.\n\nРазблокируйте аккаунт и отправьте команду:\n/stars {username}",
         "failed_to_fetch_username": "❌ {buyer}, не удалось проверить юзернейм @{username} (ошибка на стороне Telegram).\nПродавец уже уведомлён!\n\nПопробуйте позже, отправив команду:\n/stars {username}",
+        "username_received": "✅ Юзернейм @{username} принят для заказа {order_id}. Проверяю аккаунт Telegram.",
+        "stars_command_usage": "❌ Укажите Telegram-юзернейм целиком:\n/stars @ваш_юзернейм\n\nЕсли ожидают несколько заказов:\n/stars НОМЕР_ЗАКАЗА @ваш_юзернейм",
+        "stars_no_waiting_order": "Нет заказа со звёздами, ожидающего исправления юзернейма. Если заказ только что оплачен, дождитесь его обработки; в остальных случаях напишите продавцу.",
+        "stars_multiple_orders": "Ожидают юзернейм несколько заказов: {orders}.\nУкажите нужный заказ:\n/stars НОМЕР_ЗАКАЗА @ваш_юзернейм",
     },
 }
 
@@ -163,9 +167,11 @@ CHECK_USERNAME_ERRORS = {
 STARS_AMOUNT_RE = re.compile(r"(\d+)\s*(?:звёзд|звезд|Stars)", re.IGNORECASE)
 PCS_RE = re.compile(r",\s*(\d+)\s*(?:шт|pcs)\.?", re.IGNORECASE)
 BY_USERNAME_RE = re.compile(r"(?:по\s*username|by\s*username)", re.IGNORECASE)
-TRAILING_USERNAME_RE = re.compile(r",\s*@?([a-zA-Z0-9_]{4,32})\s*$")
-USERNAME_RE = re.compile(r"@?([a-zA-Z0-9_]{4,32})")
 USERNAME_FULL_RE = re.compile(r"^@?[a-zA-Z0-9_]{4,32}$")
+STARS_COMMAND_RE = re.compile(r"^[/!]stars(?:\s|$)", re.IGNORECASE)
+TELEGRAM_LINK_RE = re.compile(
+    r"(?:https?://)?(?:t\.me|telegram\.me)/([a-zA-Z0-9_]{4,32})/?", re.IGNORECASE
+)
 STARS_CATEGORY_RE = re.compile(r"Telegram.*(?:Звёзд|Звезд|Stars)", re.IGNORECASE)
 
 
@@ -511,6 +517,13 @@ class Storage:
                 if str(o.get("buyer_id")) == str(buyer_id) and (status is None or o["status"] == status)
             ])
 
+    def find_by_buyer_name(self, buyer_name: str) -> list[dict]:
+        with self._lock:
+            return copy.deepcopy([
+                o for o in self.orders.values()
+                if buyer_name and str(o.get("buyer_name") or "").casefold() == buyer_name.casefold()
+            ])
+
     def get_ready_orders(self, limit: int = 65) -> list[dict]:
         with self._lock:
             result = []
@@ -530,6 +543,15 @@ class Storage:
                 if o.get("payment_attempt", {}).get("state") == "PENDING"
                 or o["status"] == ST_TRANSFERRING
                 or (o["status"] == ST_NEEDS_REVIEW and o.get("error") == ERR_PAYMENT_UNCERTAIN)
+            ])
+
+    def get_unchecked_orders(self) -> list[dict]:
+        with self._lock:
+            return copy.deepcopy([
+                o for o in self.orders.values()
+                if (o["status"] == ST_UNPROCESSED
+                    or (o["status"] == ST_WAITING_USERNAME and o.get("error") is None))
+                and o.get("payment_attempt", {}).get("state") not in ("PENDING", "CONFIRMED")
             ])
 
     def get_confirmed_seqno(self, wallet_address: str) -> int:
@@ -597,11 +619,26 @@ def is_stars_order(description: str, subcategory: str = "") -> bool:
 
 def extract_username(text: str) -> str | None:
     clean = _strip(text)
-    m = TRAILING_USERNAME_RE.search(clean)
-    if m:
-        return m.group(1)
-    m = USERNAME_RE.search(clean)
-    return m.group(1) if m else None
+    # Получатель — отдельное поле в конце описания, а не слово Telegram/username.
+    username = _normalize_username(clean.rsplit(",", 1)[-1].strip())
+    if username:
+        return username
+    explicit = re.search(r"(?:^|\s)(@\S+)\s*$", clean)
+    return _normalize_username(explicit.group(1)) if explicit else None
+
+
+def _command_text(text: str) -> str:
+    text = html.unescape(_strip(text))
+    # Символы форматирования часто попадают в команду при копировании.
+    return re.sub(r"[\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]", "", text).strip()
+
+
+def _normalize_username(text: str) -> str | None:
+    text = _command_text(text)
+    if USERNAME_FULL_RE.fullmatch(text):
+        return text.lstrip("@")
+    link = TELEGRAM_LINK_RE.fullmatch(text)
+    return link.group(1) if link else None
 
 
 def build_stars_order(order) -> dict | None:
@@ -691,6 +728,8 @@ class AutoStarsService:
         self._admin_chat_id: int | None = config.get("admin_chat_id")
         self._thread = threading.Thread(target=self._loop, daemon=True, name="AutoStarsLoop")
         self._thread.start()
+        for order in self.storage.get_unchecked_orders():
+            threading.Thread(target=self._check_username, args=(order,), daemon=True).start()
         logger.info(f"{LOGGER_PREFIX} Сервис запущен.")
 
     # ---------- отправка сообщений ----------
@@ -726,28 +765,56 @@ class AutoStarsService:
     # ---------- проверка username ----------
 
     def _check_username(self, order: dict) -> None:
+        order_id = order["order_id"]
         with self._checking_lock:
-            if order["order_id"] in self._checking:
+            if order_id in self._checking:
                 return
-            order = self.storage.get(order["order_id"])
-            if not order or order["status"] not in (ST_UNPROCESSED, ST_WAITING_USERNAME):
+            order = self.storage.get(order_id)
+            if not self._awaits_username(order):
                 return
-            self._checking.add(order["order_id"])
+            self._checking.add(order_id)
+        result = None
         try:
-            username = order.get("telegram_username")
-            if not username or not USERNAME_FULL_RE.match(username):
-                order["status"], order["error"] = ST_WAITING_USERNAME, ERR_INVALID_USERNAME
-            elif self.fragment is None:
-                order["status"], order["error"] = ST_WAITING_USERNAME, ERR_FRAGMENT_NOT_PROVIDED
-            else:
-                self._do_check(order, username.lstrip("@"))
-            with self._checking_lock:
-                self.storage.upsert(order)
-            if order["status"] == ST_WAITING_USERNAME:
-                self._notify_username_error(order)
+            while True:
+                username = order.get("telegram_username")
+                revision = order.get("username_revision", 0)
+                order["recipient_id"] = None
+                if not username or not USERNAME_FULL_RE.fullmatch(username):
+                    order["status"], order["error"] = ST_WAITING_USERNAME, ERR_INVALID_USERNAME
+                elif self.fragment is None:
+                    order["status"], order["error"] = ST_WAITING_USERNAME, ERR_FRAGMENT_NOT_PROVIDED
+                else:
+                    self._do_check(order, username.lstrip("@"))
+                with self._checking_lock:
+                    current = self.storage.get(order_id)
+                    if not self._awaits_username(current):
+                        return
+                    if (current.get("username_revision", 0) != revision
+                            or current.get("telegram_username") != username):
+                        # Команда во время запроса не теряется: проверяем последний ответ.
+                        order = current
+                        continue
+                    for key in ("status", "error", "recipient_id"):
+                        current[key] = order.get(key)
+                    self.storage.upsert(current)
+                    result = current
+                    break
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"{LOGGER_PREFIX} Ошибка проверки юзернейма заказа {order_id}: {e}")
         finally:
             with self._checking_lock:
-                self._checking.discard(order["order_id"])
+                self._checking.discard(order_id)
+        # Освобождаем проверку до отправки подсказки: покупатель может ответить сразу.
+        if result and result["status"] == ST_WAITING_USERNAME:
+            current = self.storage.get(order_id)
+            if (self._awaits_username(current)
+                    and current.get("username_revision", 0) == result.get("username_revision", 0)):
+                self._notify_username_error(result)
+
+    @staticmethod
+    def _awaits_username(order: dict | None) -> bool:
+        return bool(order and order["status"] in (ST_UNPROCESSED, ST_WAITING_USERNAME)
+                    and order.get("payment_attempt", {}).get("state") not in ("PENDING", "CONFIRMED"))
 
     def _do_check(self, order: dict, username: str) -> None:
         for attempt in range(3):
@@ -787,58 +854,118 @@ class AutoStarsService:
     def handle_new_message(self, message) -> None:
         try:
             author_id = getattr(message, "author_id", None)
-            # Не реагируем на собственные сообщения продавца.
-            if author_id is not None and author_id == self.cardinal.account.id:
+            # Системные сообщения и сообщения продавца не меняют получателя.
+            if (author_id is None or not str(author_id).isdigit() or int(author_id) <= 0
+                    or str(author_id) == str(self.cardinal.account.id)):
                 return
-            text = _strip(getattr(message, "text", "") or "")
-            if not text:
+            chat_id = getattr(message, "chat_id", None)
+            text = _command_text(getattr(message, "text", "") or "")
+            if not text or chat_id is None:
                 return
-
-            # Ищем заказ покупателя по его ID (надёжно: chat_id у заказа и у
-            # сообщения имеют разный формат). Запасной вариант — по chat_id.
-            waiting = []
-            if author_id is not None:
-                waiting = self.storage.find_by_buyer(author_id, ST_WAITING_USERNAME)
-            if not waiting and getattr(message, "chat_id", None) is not None:
-                waiting = self.storage.find_by_chat(message.chat_id, ST_WAITING_USERNAME)
-            if not waiting:
-                return
-
+            is_command = bool(STARS_COMMAND_RE.match(text))
             username = self._parse_username(text)
             if not username:
+                if is_command:
+                    self._command_reply(message, "stars_command_usage")
                 return
-            to_recheck = []
-            for order in waiting:
-                with self._checking_lock:
-                    if order["order_id"] in self._checking:
-                        continue
-                    order = self.storage.get(order["order_id"])
-                    if not order or order["status"] != ST_WAITING_USERNAME:
-                        continue
-                    order["telegram_username"] = username
-                    order["error"] = None
-                    # Запоминаем активный node чата, чтобы ответы точно дошли.
-                    if getattr(message, "chat_id", None) is not None:
-                        order["chat_id"] = message.chat_id
-                    self.storage.upsert(order)
-                    to_recheck.append(order)
-            if to_recheck:
-                for order in to_recheck:
-                    threading.Thread(
-                        target=self._check_username, args=(order,), daemon=True
-                    ).start()
+
+            # ID покупателя надёжен, даже если chat_id заказа — users-A-B,
+            # а в сообщении указан числовой node чата.
+            buyer_orders = self.storage.find_by_buyer(author_id)
+            if not buyer_orders:
+                buyer_orders = [o for o in self.storage.find_by_chat(chat_id)
+                                if o.get("buyer_id") in (None, 0, "")]
+            message_id = getattr(message, "id", None)
+            message_id = int(message_id) if str(message_id).isdigit() else 0
+            if message_id and any(
+                str(o.get("last_username_chat_id")) == str(chat_id)
+                and o.get("last_username_message_id", 0) >= message_id for o in buyer_orders
+            ):
+                return
+            parts = text.split()
+            target_id = parts[1].lstrip("#").upper() if is_command and len(parts) == 3 else None
+            reply, accepted, needs_worker = None, None, False
+            with self._checking_lock:
+                waiting = [self.storage.get(o["order_id"]) for o in buyer_orders]
+                waiting = [o for o in waiting if self._awaits_username(o)]
+                if target_id:
+                    waiting = [o for o in waiting if str(o["order_id"]).upper() == target_id]
+                if not waiting:
+                    reply = "stars_no_waiting_order" if is_command else None
+                elif len(waiting) > 1:
+                    reply = "stars_multiple_orders"
+                else:
+                    accepted = waiting[0]
+                    if (message_id and str(accepted.get("last_username_chat_id")) == str(chat_id)
+                            and accepted.get("last_username_message_id", 0) >= message_id):
+                        return
+                    accepted["telegram_username"] = username
+                    accepted["recipient_id"] = None
+                    accepted["status"], accepted["error"] = ST_WAITING_USERNAME, None
+                    accepted["username_revision"] = int(accepted.get("username_revision", 0)) + 1
+                    accepted["chat_id"] = chat_id
+                    accepted["buyer_id"] = author_id
+                    if message_id:
+                        accepted["last_username_message_id"] = message_id
+                        accepted["last_username_chat_id"] = chat_id
+                    self.storage.upsert(accepted)
+                    needs_worker = accepted["order_id"] not in self._checking
+            if reply:
+                self._command_reply(message, reply, orders=", ".join(o["order_id"] for o in waiting))
+            if accepted:
+                self._command_reply(message, "username_received", accepted)
+                if needs_worker:
+                    threading.Thread(target=self._check_username, args=(accepted,), daemon=True).start()
         except Exception as e:  # noqa: BLE001
             logger.error(f"{LOGGER_PREFIX} Ошибка обработки сообщения: {e}")
 
     def _parse_username(self, text: str) -> str | None:
-        if text.lower().startswith(("/stars", "!stars")):
+        text = _command_text(text)
+        if STARS_COMMAND_RE.match(text):
             parts = text.split()
-            if len(parts) >= 2:
-                m = USERNAME_RE.search(parts[1])
-                return m.group(1) if m else None
-            return None
-        m = re.match(r"^@?([a-zA-Z0-9_]{4,32})$", text)
-        return m.group(1) if m else None
+            if len(parts) not in (2, 3):
+                return None
+            if len(parts) == 3 and not re.fullmatch(r"#?[a-zA-Z0-9]{1,64}", parts[1]):
+                return None
+            text = parts[-1]
+        return _normalize_username(text)
+
+    def _command_reply(self, message, key: str, order: dict | None = None, **extra) -> None:
+        context = dict(order or {})
+        context["chat_id"] = message.chat_id
+        context.setdefault("buyer_name", getattr(message, "author", None) or "")
+        template = self.config.get("messages", {}).get(key, DEFAULT_CONFIG["messages"][key])
+        self._send(context, format_message(template, context, **extra))
+
+    def handle_last_chat_message(self, chat) -> None:
+        """В старом режиме FPC присылает только изменение последнего сообщения."""
+        text = _command_text(getattr(chat, "last_message_text", "") or "")
+        if not STARS_COMMAND_RE.match(text):
+            if not self._parse_username(text):
+                return
+            # Для обычных реплик не запрашиваем историю чужих/закрытых заказов.
+            related = self.storage.find_by_chat(chat.id)
+            related += self.storage.find_by_buyer_name(getattr(chat, "name", None) or "")
+            if not any(self._awaits_username(o) for o in related):
+                return
+
+        def worker():
+            try:
+                # По unread нельзя определять автора: читаем настоящее сообщение.
+                messages = self.cardinal.account.get_chat_history(chat.id)
+                node_message_id = getattr(chat, "node_msg_id", None)
+                if node_message_id is not None:
+                    messages = [m for m in messages if str(m.id) == str(node_message_id)]
+                elif messages:
+                    messages = messages[-1:]
+                    if _command_text(messages[0].text or "") != text:
+                        return
+                for message in messages:
+                    self.handle_new_message(message)
+            except Exception as e:  # noqa: BLE001
+                logger.error(f"{LOGGER_PREFIX} Не удалось прочитать команду в чате {chat.id}: {e}")
+
+        threading.Thread(target=worker, daemon=True).start()
 
     # ---------- цикл перевода ----------
 
@@ -1314,6 +1441,10 @@ MESSAGE_LABELS = {
     "not_user_username": "📢 Юзернейм не пользователя",
     "blocked_by_user": "🚫 Заблокирован покупателем",
     "failed_to_fetch_username": "👤 Ошибка проверки юзернейма",
+    "username_received": "✅ Юзернейм принят",
+    "stars_command_usage": "✍️ Формат команды /stars",
+    "stars_no_waiting_order": "📦 Нет заказа для исправления",
+    "stars_multiple_orders": "📦 Выбор заказа для исправления",
 }
 PROVIDER_KEYS = {"fragment_cookies", "fragment_hash", "ton_mnemonic", "ton_api_token"}
 SECRET_KEYS = {"fragment_cookies", "fragment_hash", "ton_mnemonic", "ton_api_token"}
@@ -1574,6 +1705,11 @@ def on_new_message(cardinal: "Cardinal", event: "NewMessageEvent", *args) -> Non
         SERVICE.handle_new_message(event.message)
 
 
+def on_last_chat_message_changed(cardinal: "Cardinal", event, *args) -> None:
+    if SERVICE is not None and getattr(cardinal, "old_mode_enabled", False):
+        SERVICE.handle_last_chat_message(event.chat)
+
+
 def _format_review(template: str, order) -> str:
     review = getattr(order, "review", None)
     data = {
@@ -1636,5 +1772,6 @@ BIND_TO_PRE_INIT = [register_settings]
 BIND_TO_POST_INIT = [init]
 BIND_TO_NEW_ORDER = [on_new_order]
 BIND_TO_NEW_MESSAGE = [on_new_message, on_new_review]
+BIND_TO_LAST_CHAT_MESSAGE_CHANGED = [on_last_chat_message_changed]
 BIND_TO_POST_STOP = [on_stop]
 BIND_TO_DELETE = None
