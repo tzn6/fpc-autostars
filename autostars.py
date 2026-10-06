@@ -30,7 +30,10 @@ import re
 import json
 import time
 import base64
+import copy
+import html
 import logging
+import tempfile
 import threading
 from typing import TYPE_CHECKING, Any
 
@@ -43,7 +46,7 @@ if TYPE_CHECKING:
 # --- зависимость pytoniq (для подписи TON-транзакций) ---
 try:
     from pytoniq import WalletV5R1
-    from pytoniq_core import Address, StateInit, Cell
+    from pytoniq_core import Address, StateInit, Cell, begin_cell
     from pytoniq_core.crypto.keys import mnemonic_is_valid, mnemonic_to_private_key
     from pytoniq.contract.wallets.wallet_v5 import WALLET_V5_R1_CODE
 
@@ -57,7 +60,7 @@ except Exception as e:  # noqa: BLE001
 # ============================== МЕТА-ДАННЫЕ ПЛАГИНА ==============================
 
 NAME = "AutoStars"
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 DESCRIPTION = (
     "Автовыдача Telegram Stars: покупка звёзд через Fragment и оплата с "
     "TON-кошелька W5. Требует: pip install pytoniq."
@@ -79,6 +82,9 @@ WALLET_V5R1_ID = 2147483409
 TON_NETWORK_GLOBAL_ID = -239
 ONE_TON = 1_000_000_000
 AD_TEXT = "Stars sent automatically by AutoStars plugin for FunPayCardinal."
+PAYMENT_REVIEW_GRACE_SEC = 120
+MIN_PAYMENT_TTL_SEC = 15
+PAYMENT_REBROADCAST_SEC = 30
 
 DEFAULT_CONFIG = {
     "fragment_cookies": "",
@@ -109,6 +115,8 @@ ST_UNPROCESSED = "UNPROCESSED"
 ST_WAITING_USERNAME = "WAITING_FOR_USERNAME"
 ST_READY = "READY"
 ST_TRANSFERRING = "TRANSFERRING"
+ST_NEEDS_REVIEW = "NEEDS_REVIEW"
+ST_REFUND_PENDING = "REFUND_PENDING"
 ST_DONE = "DONE"
 ST_ERROR = "ERROR"
 ST_REFUNDED = "REFUNDED"
@@ -125,6 +133,8 @@ ERR_GET_BALANCE = "GET_BALANCE_ERROR"
 ERR_NOT_ENOUGH_TON = "NOT_ENOUGH_TON"
 ERR_TRANSFER = "TRANSFER_ERROR"
 ERR_TIMEOUT = "TRANSACTION_TIMEOUT_ERROR"
+ERR_TRANSACTION_FAILED = "TRANSACTION_FAILED"
+ERR_PAYMENT_UNCERTAIN = "PAYMENT_RESULT_UNCERTAIN"
 
 ERROR_DESC = {
     ERR_INVALID_USERNAME: "Невалидный Telegram юзернейм",
@@ -138,6 +148,8 @@ ERROR_DESC = {
     ERR_NOT_ENOUGH_TON: "Недостаточно TON",
     ERR_TRANSFER: "Не удалось отправить транзакцию",
     ERR_TIMEOUT: "Таймаут ожидания подтверждения транзакции",
+    ERR_TRANSACTION_FAILED: "TON-транзакция завершилась без отправки платежей",
+    ERR_PAYMENT_UNCERTAIN: "Результат платежа пока не подтверждён; повтор и возврат заблокированы",
 }
 
 CHECK_USERNAME_ERRORS = {
@@ -294,7 +306,10 @@ class TonAPI:
         self._request("POST", "/v2/blockchain/message", {"boc": boc})
 
     def get_transaction_by_message_hash(self, message_hash: str) -> dict | None:
-        return self._request("GET", f"/v2/blockchain/messages/{message_hash}/transaction")
+        data = self._request("GET", f"/v2/blockchain/messages/{message_hash}/transaction")
+        if data is not None and (not isinstance(data, dict) or not data.get("hash")):
+            raise TonAPIError("invalid transaction response")
+        return data
 
     def wait_for_transfer(self, message_hash: str, valid_until: int) -> dict:
         while time.time() < valid_until:
@@ -390,8 +405,11 @@ class Wallet:
     def get_balance(self) -> int:
         return int(self.tonapi.get_wallet(self.address)["balance"])
 
-    def transfer(self, transfers: list[dict], wait_seconds: int = 60) -> dict:
-        deadline = int(time.time() + wait_seconds)
+    def prepare_transfer(self, transfers: list[dict]) -> dict:
+        """Подписывает платёж. Вызывающий код обязан сохранить его до отправки."""
+        valid_until = min(t["valid_until"] for t in transfers)
+        if valid_until <= time.time() + MIN_PAYMENT_TTL_SEC:
+            raise ValueError("Срок действия платежа Fragment истекает; платёж не отправлен.")
         # Берём максимум: tonapi может вернуть устаревшее значение,
         # но мы точно знаем что следующий seqno не меньше _min_seqno.
         tonapi_seqno = self.tonapi.get_seqno(self.address)
@@ -402,11 +420,22 @@ class Wallet:
                 f"используем локальный {seqno}."
             )
         boc, in_hash = self.offline.build_external_transfer(seqno, transfers)
-        self.tonapi.send_boc(boc)
-        tx = self.tonapi.wait_for_transfer(in_hash, deadline)
-        # Фиксируем следующий ожидаемый seqno.
-        self._min_seqno = seqno + 1
-        return {"hash": tx["hash"], "in_msg_hash": in_hash}
+        return {
+            "wallet_address": self.address,
+            "seqno": seqno,
+            "boc": boc,
+            "in_msg_hash": in_hash,
+            "valid_until": valid_until,
+            "created_at": int(time.time()),
+            "state": "PENDING",
+        }
+
+    def broadcast_transfer(self, attempt: dict) -> None:
+        self.tonapi.send_boc(attempt["boc"])
+
+    def confirm_seqno(self, attempt: dict) -> None:
+        # Сохраняем защиту от кэшированного seqno только после успешного исполнения.
+        self._min_seqno = max(self._min_seqno, int(attempt["seqno"]) + 1)
 
 
 # ============================== Хранилище заказов ==============================
@@ -415,56 +444,142 @@ class Storage:
     def __init__(self, path: str = ORDERS_PATH):
         self.path = path
         self.orders: dict[str, dict] = {}
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self.load()
 
     def load(self) -> None:
         try:
             with open(self.path, "r", encoding="utf-8") as f:
                 self.orders = json.load(f)
+            if not isinstance(self.orders, dict) or any(
+                not isinstance(o, dict) or o.get("order_id") != order_id or "status" not in o
+                for order_id, o in self.orders.items()
+            ):
+                raise ValueError("invalid orders storage")
+            migrated = False
+            for order in self.orders.values():
+                if (not order.get("payment_attempt") and order["status"] == ST_ERROR
+                        and order.get("error") in (ERR_TRANSFER, ERR_TIMEOUT)
+                        and order.get("retries_left", 0) > 0):
+                    # В 0.2.0 таймаут после send_boc сохранялся как обычный TRANSFER_ERROR.
+                    order["status"], order["error"] = ST_NEEDS_REVIEW, ERR_PAYMENT_UNCERTAIN
+                    order["payment_review_reason"] = "Ошибка старой версии без сохранённого хеша платежа."
+                    migrated = True
+            if migrated:
+                self.save()
         except FileNotFoundError:
             self.orders = {}
         except Exception as e:  # noqa: BLE001
             logger.error(f"{LOGGER_PREFIX} Ошибка чтения {self.path}: {e}")
-            self.orders = {}
+            raise RuntimeError("История заказов повреждена; автовыдача остановлена.") from e
 
     def save(self) -> None:
         with self._lock:
-            os.makedirs(os.path.dirname(self.path), exist_ok=True)
-            with open(self.path, "w", encoding="utf-8") as f:
-                json.dump(self.orders, f, ensure_ascii=False, indent=2)
+            _atomic_write_json(self.path, self.orders)
 
     def has(self, order_id: str) -> bool:
-        return order_id in self.orders
+        with self._lock:
+            return order_id in self.orders
 
     def get(self, order_id: str) -> dict | None:
-        return self.orders.get(order_id)
+        with self._lock:
+            return copy.deepcopy(self.orders.get(order_id))
 
     def upsert(self, *orders: dict) -> None:
-        for o in orders:
-            self.orders[o["order_id"]] = o
-        self.save()
+        with self._lock:
+            previous = self.orders
+            self.orders = dict(previous)
+            try:
+                for o in orders:
+                    self.orders[o["order_id"]] = copy.deepcopy(o)
+                self.save()
+            except Exception:
+                self.orders = previous
+                raise
 
     def find_by_chat(self, chat_id: Any, status: str | None = None) -> list[dict]:
-        return [
-            o for o in self.orders.values()
-            if str(o.get("chat_id")) == str(chat_id) and (status is None or o["status"] == status)
-        ]
+        with self._lock:
+            return copy.deepcopy([
+                o for o in self.orders.values()
+                if str(o.get("chat_id")) == str(chat_id) and (status is None or o["status"] == status)
+            ])
 
     def find_by_buyer(self, buyer_id: Any, status: str | None = None) -> list[dict]:
-        return [
-            o for o in self.orders.values()
-            if str(o.get("buyer_id")) == str(buyer_id) and (status is None or o["status"] == status)
-        ]
+        with self._lock:
+            return copy.deepcopy([
+                o for o in self.orders.values()
+                if str(o.get("buyer_id")) == str(buyer_id) and (status is None or o["status"] == status)
+            ])
 
     def get_ready_orders(self, limit: int = 65) -> list[dict]:
-        result = []
-        for o in self.orders.values():
-            if o["status"] == ST_READY or (o["status"] == ST_ERROR and o["retries_left"] > 0):
-                result.append(o)
-            if len(result) >= limit:
-                break
-        return result
+        with self._lock:
+            result = []
+            for o in self.orders.values():
+                if o.get("payment_attempt", {}).get("state") == "PENDING":
+                    continue
+                if o["status"] == ST_READY or (o["status"] == ST_ERROR and o["retries_left"] > 0):
+                    result.append(copy.deepcopy(o))
+                if len(result) >= limit:
+                    break
+            return result
+
+    def get_pending_orders(self) -> list[dict]:
+        with self._lock:
+            return copy.deepcopy([
+                o for o in self.orders.values()
+                if o.get("payment_attempt", {}).get("state") == "PENDING"
+                or o["status"] == ST_TRANSFERRING
+                or (o["status"] == ST_NEEDS_REVIEW and o.get("error") == ERR_PAYMENT_UNCERTAIN)
+            ])
+
+    def get_confirmed_seqno(self, wallet_address: str) -> int:
+        """Восстанавливает нижнюю границу seqno из подтверждённых платежей."""
+        with self._lock:
+            attempts = [o.get("payment_attempt", {}) for o in self.orders.values()]
+            return max((
+                int(a["seqno"]) + 1 for a in attempts
+                if a.get("wallet_address") == wallet_address and a.get("wallet_executed")
+            ), default=0)
+
+    def get_attempt_orders(self, wallet_address: str, message_hash: str) -> list[dict]:
+        with self._lock:
+            return copy.deepcopy([
+                o for o in self.orders.values()
+                if o.get("payment_attempt", {}).get("wallet_address") == wallet_address
+                and o.get("payment_attempt", {}).get("in_msg_hash") == message_hash
+            ])
+
+
+def _atomic_write_json(path: str, data: dict) -> None:
+    """Запись в той же ФС: flush/fsync, затем атомарная замена файла."""
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=".autostars-", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temporary, path)
+        if os.name == "posix":
+            directory_fd = os.open(directory, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def _outgoing_key(message: dict) -> tuple[str, int, str]:
+    """Сверяем адрес, сумму и hash payload, а не только факт существования tx."""
+    address = message["destination"]
+    if isinstance(address, dict):
+        address = address["address"]
+    raw_body = message["raw_body"]
+    body_hash = Cell.one_from_boc(bytes.fromhex(raw_body)).hash.hex()
+    return Address(address).to_str(is_user_friendly=False), int(message["value"]), body_hash
 
 
 # ============================== Разбор заказа ==============================
@@ -543,6 +658,7 @@ class AutoStarsService:
     def __init__(self, cardinal: "Cardinal", config: dict):
         self.cardinal = cardinal
         self.config = config
+        self._provider_lock = threading.RLock()
         self.storage = Storage()
         self.tonapi = TonAPI(config.get("ton_api_token") or None)
 
@@ -557,6 +673,7 @@ class AutoStarsService:
         if config.get("ton_mnemonic"):
             try:
                 self.wallet = Wallet.from_mnemonic(config["ton_mnemonic"], self.tonapi)
+                self.wallet._min_seqno = self.storage.get_confirmed_seqno(self.wallet.address)
                 balance = self.wallet.get_balance()
                 logger.info(f"{LOGGER_PREFIX} TON кошелёк подключён: {self.wallet.address} "
                             f"(баланс {balance / ONE_TON} TON).")
@@ -567,10 +684,11 @@ class AutoStarsService:
 
         self._loop_busy = False
         self._checking = set()
+        self._checking_lock = threading.Lock()
         self._stop = threading.Event()
         self._low_balance_paused = False
-        self._bot = None
-        self._admin_chat_id: int | None = None
+        self._bot = getattr(getattr(cardinal, "telegram", None), "bot", None)
+        self._admin_chat_id: int | None = config.get("admin_chat_id")
         self._thread = threading.Thread(target=self._loop, daemon=True, name="AutoStarsLoop")
         self._thread.start()
         logger.info(f"{LOGGER_PREFIX} Сервис запущен.")
@@ -608,19 +726,28 @@ class AutoStarsService:
     # ---------- проверка username ----------
 
     def _check_username(self, order: dict) -> None:
-        username = order.get("telegram_username")
-        if not username or not USERNAME_FULL_RE.match(username):
-            order["status"], order["error"] = ST_WAITING_USERNAME, ERR_INVALID_USERNAME
-        elif self.fragment is None:
-            order["status"], order["error"] = ST_WAITING_USERNAME, ERR_FRAGMENT_NOT_PROVIDED
-        else:
+        with self._checking_lock:
+            if order["order_id"] in self._checking:
+                return
+            order = self.storage.get(order["order_id"])
+            if not order or order["status"] not in (ST_UNPROCESSED, ST_WAITING_USERNAME):
+                return
             self._checking.add(order["order_id"])
-            self._do_check(order, username.lstrip("@"))
-            self._checking.discard(order["order_id"])
-
-        self.storage.upsert(order)
-        if order["status"] == ST_WAITING_USERNAME:
-            self._notify_username_error(order)
+        try:
+            username = order.get("telegram_username")
+            if not username or not USERNAME_FULL_RE.match(username):
+                order["status"], order["error"] = ST_WAITING_USERNAME, ERR_INVALID_USERNAME
+            elif self.fragment is None:
+                order["status"], order["error"] = ST_WAITING_USERNAME, ERR_FRAGMENT_NOT_PROVIDED
+            else:
+                self._do_check(order, username.lstrip("@"))
+            with self._checking_lock:
+                self.storage.upsert(order)
+            if order["status"] == ST_WAITING_USERNAME:
+                self._notify_username_error(order)
+        finally:
+            with self._checking_lock:
+                self._checking.discard(order["order_id"])
 
     def _do_check(self, order: dict, username: str) -> None:
         for attempt in range(3):
@@ -682,16 +809,20 @@ class AutoStarsService:
                 return
             to_recheck = []
             for order in waiting:
-                if order["order_id"] in self._checking:
-                    continue
-                order["telegram_username"] = username
-                order["error"] = None
-                # Запоминаем активный node чата, чтобы ответы точно дошли.
-                if getattr(message, "chat_id", None) is not None:
-                    order["chat_id"] = message.chat_id
-                to_recheck.append(order)
+                with self._checking_lock:
+                    if order["order_id"] in self._checking:
+                        continue
+                    order = self.storage.get(order["order_id"])
+                    if not order or order["status"] != ST_WAITING_USERNAME:
+                        continue
+                    order["telegram_username"] = username
+                    order["error"] = None
+                    # Запоминаем активный node чата, чтобы ответы точно дошли.
+                    if getattr(message, "chat_id", None) is not None:
+                        order["chat_id"] = message.chat_id
+                    self.storage.upsert(order)
+                    to_recheck.append(order)
             if to_recheck:
-                self.storage.upsert(*to_recheck)
                 for order in to_recheck:
                     threading.Thread(
                         target=self._check_username, args=(order,), daemon=True
@@ -717,42 +848,50 @@ class AutoStarsService:
             self._stop.wait(interval)
             if self._stop.is_set():
                 break
-            if self._loop_busy or not self.fragment or not self.wallet:
+            if self._loop_busy:
                 continue
             self._loop_busy = True
             try:
-                # Проверяем баланс на пороговое значение до обработки заказов.
-                # Если включён low_balance_threshold или цикл уже на паузе — делаем запрос.
-                if float(self.config.get("low_balance_threshold", 0)) > 0 or self._low_balance_paused:
-                    try:
-                        bal = self.wallet.get_balance()
-                        if self._check_low_balance(bal):
-                            continue
-                    except Exception as e:  # noqa: BLE001
-                        logger.warning(f"{LOGGER_PREFIX} Не удалось проверить баланс: {e}")
-                        if self._low_balance_paused:
-                            continue
-                orders = self.storage.get_ready_orders()
-                if not orders:
-                    continue
-                for o in orders:
-                    o["retries_left"] -= 1
-                self.storage.upsert(*orders)
-                logger.info(f"{LOGGER_PREFIX} Перевод TON по заказам: "
-                            f"{', '.join(o['order_id'] for o in orders)}.")
-                self._transfer_batch(orders)
+                with self._provider_lock:
+                    # Сначала восстанавливаем старые попытки, даже при смене ключей/низком балансе.
+                    self._reconcile_pending()
+                    if self.storage.get_pending_orders() or not self.fragment or not self.wallet:
+                        continue
+                    if float(self.config.get("low_balance_threshold", 0)) > 0 or self._low_balance_paused:
+                        try:
+                            bal = self.wallet.get_balance()
+                            if self._check_low_balance(bal):
+                                continue
+                        except Exception as e:  # noqa: BLE001
+                            logger.warning(f"{LOGGER_PREFIX} Не удалось проверить баланс: {e}")
+                            if self._low_balance_paused:
+                                continue
+                    orders = self.storage.get_ready_orders()
+                    if not orders:
+                        continue
+                    for o in orders:
+                        o["retries_left"] -= 1
+                    self.storage.upsert(*orders)
+                    logger.info(f"{LOGGER_PREFIX} Перевод TON по заказам: "
+                                f"{', '.join(o['order_id'] for o in orders)}.")
+                    self._transfer_batch(orders)
             except Exception as e:  # noqa: BLE001
                 logger.error(f"{LOGGER_PREFIX} Ошибка в цикле перевода: {e}")
             finally:
                 self._loop_busy = False
 
     def _transfer_batch(self, orders: list[dict]) -> None:
+        if self.storage.get_pending_orders():
+            return
         prepared = []
         for order in orders:
             transfer = self._prepare_transfer(order)
             if transfer:
                 prepared.append((order, transfer))
         self.storage.upsert(*orders)
+        for order in orders:
+            if order["status"] == ST_ERROR and order["retries_left"] <= 0:
+                self._on_fail(order)
         if not prepared:
             return
 
@@ -781,32 +920,199 @@ class AutoStarsService:
 
         fit_orders = [o for o, _ in fit]
         try:
-            result = self.wallet.transfer([t for _, t in fit])
+            attempt = self.wallet.prepare_transfer([t for _, t in fit])
         except Exception as e:  # noqa: BLE001
-            logger.error(f"{LOGGER_PREFIX} Ошибка перевода TON: {e}")
+            logger.error(f"{LOGGER_PREFIX} Ошибка подготовки TON (платёж не отправлен): {e}")
             self._fail(fit_orders, ERR_TRANSFER)
             return
 
-        for order in fit_orders:
-            order["status"] = ST_DONE
+        for order, transfer in fit:
+            previous = order.get("payment_attempt")
+            if previous:
+                order.setdefault("payment_history", []).append(previous)
+            order["payment_attempt"] = copy.deepcopy(attempt)
+            order["payment_attempt"]["last_broadcast_at"] = int(time.time())
+            order.pop("payment_review_notified", None)
+            order.pop("payment_review_reason", None)
+            order["expected_message"] = {
+                "address": transfer["address"],
+                "amount": transfer["amount"],
+                "body_hash": transfer["body"].hash.hex(),
+                "request_id": transfer["request_id"],
+            }
+            order["status"] = ST_TRANSFERRING
             order["error"] = None
-            order["transaction_hash"] = result["hash"]
+        # Write-ahead: если запись не удалась, send_boc никогда не вызывается.
         self.storage.upsert(*fit_orders)
-        logger.info(f"{LOGGER_PREFIX} Звёзды переведены. Хэш: {result['hash']}.")
-        for order in fit_orders:
+        try:
+            self.wallet.broadcast_transfer(attempt)
+        except Exception as e:  # noqa: BLE001
+            # HTTP timeout не доказывает, что TON не был отправлен.
+            logger.warning(f"{LOGGER_PREFIX} Отправка {attempt['in_msg_hash']} не подтверждена: {e}")
+        self._reconcile_pending()
+
+    def _notify_admin(self, text: str) -> bool:
+        if not self._bot or not self._admin_chat_id:
+            return False
+        try:
+            self._bot.send_message(self._admin_chat_id, text)
+            return True
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"{LOGGER_PREFIX} Не удалось уведомить продавца: {e}")
+            return False
+
+    def _mark_for_review(self, orders: list[dict], reason: str) -> None:
+        changed = any(o["status"] != ST_NEEDS_REVIEW for o in orders)
+        for order in orders:
+            order["status"], order["error"] = ST_NEEDS_REVIEW, ERR_PAYMENT_UNCERTAIN
+            order["payment_review_reason"] = reason
+        self.storage.upsert(*orders)
+        if changed:
+            logger.warning(f"{LOGGER_PREFIX} Нужна проверка платежа: {reason}")
+        if orders and any(not o.get("payment_review_notified") for o in orders):
+            message_hash = orders[0].get("payment_attempt", {}).get("in_msg_hash", "не сохранён")
+            notified = self._notify_admin(
+                "⚠️ <b>AutoStars: требуется проверка платежа</b>\n\n"
+                f"Заказы: <code>{html.escape(', '.join(o['order_id'] for o in orders))}</code>\n"
+                f"Сообщение TON: <code>{html.escape(message_hash)}</code>\n"
+                f"Причина: {html.escape(reason)}\n\n"
+                "Повторная покупка и автоматический возврат заблокированы. "
+                "Плагин продолжает проверять прежнюю транзакцию."
+            )
+            if notified:
+                for order in orders:
+                    order["payment_review_notified"] = True
+                self.storage.upsert(*orders)
+
+    def _reconcile_pending(self) -> None:
+        groups = {}
+        for order in self.storage.get_pending_orders():
+            attempt = order.get("payment_attempt", {})
+            if not attempt.get("in_msg_hash") or not attempt.get("wallet_address"):
+                self._mark_for_review([order], "У незавершённого платежа отсутствуют данные попытки.")
+                continue
+            groups[(attempt["wallet_address"], attempt["in_msg_hash"])] = attempt
+        for (wallet_address, message_hash), attempt in groups.items():
+            orders = self.storage.get_attempt_orders(wallet_address, message_hash)
+            pending = [o for o in orders if o.get("payment_attempt", {}).get("state") == "PENDING"]
+            if not pending:
+                continue
+            try:
+                tx = self.tonapi.get_transaction_by_message_hash(message_hash)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"{LOGGER_PREFIX} Пока не удалось проверить {message_hash}: {e}")
+                tx = None
+            if tx is None:
+                # Повторяем только те же подписанные байты и только в пределах срока.
+                # Это также восстанавливает остановку между записью журнала и send_boc.
+                if self.wallet and self.wallet.address == wallet_address and (
+                    time.time() < attempt["valid_until"] - MIN_PAYMENT_TTL_SEC
+                    and time.time() - attempt.get("last_broadcast_at", 0) >= PAYMENT_REBROADCAST_SEC
+                ):
+                    for order in pending:
+                        order["payment_attempt"]["last_broadcast_at"] = int(time.time())
+                    self.storage.upsert(*pending)
+                    try:
+                        self.wallet.broadcast_transfer(attempt)
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning(f"{LOGGER_PREFIX} Повторная отправка прежнего BOC {message_hash}: {e}")
+                if time.time() > attempt["valid_until"] + PAYMENT_REVIEW_GRACE_SEC:
+                    self._mark_for_review(pending, "Транзакция не найдена после истечения срока платежа.")
+                continue
+            self._resolve_transaction(orders, tx)
+
+    def _resolve_transaction(self, orders: list[dict], tx: dict) -> None:
+        pending = [o for o in orders if o["payment_attempt"].get("state") == "PENDING"]
+        attempt = pending[0]["payment_attempt"]
+        try:
+            tx_address = tx["account"]["address"]
+            if Address(tx_address).to_str(is_user_friendly=False) != Address(
+                attempt["wallet_address"]
+            ).to_str(is_user_friendly=False):
+                raise ValueError("Адрес транзакции не совпадает с кошельком попытки.")
+            outgoing = tx["out_msgs"]
+            if not isinstance(outgoing, list) or not isinstance(tx["success"], bool) or not isinstance(tx["aborted"], bool):
+                raise ValueError("Неполный ответ tonapi о результате транзакции.")
+        except Exception as e:  # noqa: BLE001
+            self._mark_for_review(pending, str(e))
+            return
+
+        if (tx["success"] is False or tx["aborted"] is True) and not outgoing:
+            # Подтверждённая неуспешная транзакция без исходящих сообщений: выплаты не было.
+            for order in pending:
+                order["payment_attempt"]["state"] = "FAILED"
+                order["payment_attempt"].pop("boc", None)
+                order["payment_attempt"]["transaction_hash"] = tx["hash"]
+                order["transaction_hash"] = tx["hash"]
+            self._fail(pending, ERR_TRANSACTION_FAILED)
+            return
+
+        if tx["success"] is not True or tx["aborted"] is not False or (
+            (tx.get("compute_phase") or {}).get("success") is False
+            or (tx.get("action_phase") or {}).get("success") is False
+        ):
+            self._mark_for_review(pending, "TON-транзакция неуспешна, но результат исходящих платежей неоднозначен.")
+            return
+
+        keys = []
+        for message in outgoing:
+            try:
+                if message.get("msg_type") == "int_msg" and message.get("bounced") is False:
+                    keys.append(_outgoing_key(message))
+            except Exception:  # noqa: BLE001 - некорректный BOC не подтверждает платёж
+                continue
+        completed, uncertain = [], []
+        for order in orders:
+            expected = order.get("expected_message", {})
+            try:
+                key = (Address(expected["address"]).to_str(is_user_friendly=False),
+                       int(expected["amount"]), expected["body_hash"])
+                matched = key in keys
+                if matched:
+                    keys.remove(key)
+            except Exception:  # noqa: BLE001
+                matched = False
+            # Учитываем уже завершённые заказы, чтобы не использовать одно сообщение дважды.
+            if order["payment_attempt"].get("state") != "PENDING":
+                continue
+            order["payment_attempt"]["wallet_executed"] = True
+            order["payment_attempt"]["transaction_hash"] = tx["hash"]
+            if matched:
+                order["status"], order["error"] = ST_DONE, None
+                order["transaction_hash"] = tx["hash"]
+                order["payment_attempt"]["state"] = "CONFIRMED"
+                order["payment_attempt"].pop("boc", None)
+                completed.append(order)
+            else:
+                uncertain.append(order)
+        # Подтверждение и seqno сохраняются атомарно до сообщений покупателю.
+        self.storage.upsert(*completed, *uncertain)
+        if self.wallet and self.wallet.address == attempt["wallet_address"]:
+            self.wallet.confirm_seqno(attempt)
+        if completed:
+            logger.info(f"{LOGGER_PREFIX} TON-платежи подтверждены по заказам "
+                        f"{', '.join(o['order_id'] for o in completed)}. Хэш: {tx['hash']}.")
+        for order in completed:
             self._on_success(order)
+        if uncertain:
+            self._mark_for_review(uncertain, "Не найдены исходящие сообщения с ожидаемыми адресом, суммой и payload.")
 
     def _prepare_transfer(self, order: dict) -> dict | None:
         try:
             req = self.fragment.init_buy_stars_request(order["recipient_id"], order["stars_amount"])
             link = self.fragment.get_buy_stars_link(req["req_id"], self.config.get("show_sender", False))
+            if len(link["transaction"]["messages"]) != 1:
+                raise FragmentError("getBuyStarsLink", "expected exactly one payment message")
             msg = link["transaction"]["messages"][0]
+            if int(msg["amount"]) <= 0:
+                raise FragmentError("getBuyStarsLink", "payment amount must be positive")
             order["ref"] = extract_ref(msg.get("payload", ""))
             return {
-                "address": msg["address"],
+                "address": Address(msg["address"]).to_str(is_user_friendly=False),
                 "amount": int(msg["amount"]),
                 "body": self._build_body(order, msg),
                 "valid_until": int(link["transaction"]["validUntil"]),
+                "request_id": req["req_id"],
             }
         except Exception as e:  # noqa: BLE001
             logger.error(f"{LOGGER_PREFIX} Ошибка получения ссылки Fragment "
@@ -817,11 +1123,15 @@ class AutoStarsService:
     def _build_body(self, order: dict, msg: dict):
         # По умолчанию используем payload Fragment как есть (надёжнее всего).
         if self.config.get("show_ad") and order.get("ref"):
-            return f"{AD_TEXT}\n\n{order['ref']}"
+            return begin_cell().store_uint(0, 32).store_snake_string(
+                f"{AD_TEXT}\n\n{order['ref']}"
+            ).end_cell()
         return Cell.one_from_boc(base64.b64decode(_pad_b64(msg["payload"])))
 
     def _fail(self, orders: list[dict], error: str) -> None:
         for order in orders:
+            if order.get("payment_attempt", {}).get("state") in ("PENDING", "CONFIRMED"):
+                raise RuntimeError("Нельзя повторить или вернуть платёж с неизвестным результатом.")
             order["status"], order["error"] = ST_ERROR, error
         self.storage.upsert(*orders)
         for order in orders:
@@ -839,23 +1149,31 @@ class AutoStarsService:
         self._send(order, format_message(msgs.get("transaction_failed", ""), order))
         logger.error(f"{LOGGER_PREFIX} Заказ {order['order_id']} провалился: "
                      f"{ERROR_DESC.get(order['error'], order['error'])}.")
+        self._notify_admin(
+            f"❌ <b>AutoStars: ошибка заказа {html.escape(order['order_id'])}</b>\n"
+            f"{html.escape(ERROR_DESC.get(order['error'], order['error']))}"
+        )
         if self.config.get("refund_on_error"):
             self._refund(order)
 
     def _refund(self, order: dict) -> None:
-        old_status = order["status"]
-        order["status"] = ST_REFUNDED
+        if order.get("payment_attempt", {}).get("state") in ("PENDING", "CONFIRMED"):
+            logger.error(f"{LOGGER_PREFIX} Возврат {order['order_id']} заблокирован: результат платежа неизвестен.")
+            return
+        order["status"] = ST_REFUND_PENDING
         self.storage.upsert(order)
-        for _ in range(3):
-            try:
-                self.cardinal.account.refund(order["order_id"])
-                logger.info(f"{LOGGER_PREFIX} Возврат по заказу {order['order_id']} выполнен.")
-                return
-            except Exception as e:  # noqa: BLE001
-                logger.error(f"{LOGGER_PREFIX} Не удалось вернуть средства "
-                             f"по заказу {order['order_id']}: {e}")
-                time.sleep(1)
-        order["status"] = old_status
+        try:
+            self.cardinal.account.refund(order["order_id"])
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"{LOGGER_PREFIX} Результат возврата {order['order_id']} неизвестен: {e}")
+            order["status"] = ST_NEEDS_REVIEW
+            self._notify_admin(
+                f"⚠️ <b>AutoStars: проверьте возврат по заказу {html.escape(order['order_id'])}</b>\n"
+                "FunPay не подтвердил результат. Автоматический повтор возврата заблокирован."
+            )
+        else:
+            order["status"] = ST_REFUNDED
+            logger.info(f"{LOGGER_PREFIX} Возврат по заказу {order['order_id']} выполнен.")
         self.storage.upsert(order)
 
     # ---------- автовыключение при низком балансе ----------
@@ -918,6 +1236,10 @@ class AutoStarsService:
             logger.error(f"{LOGGER_PREFIX} Не удалось уведомить о восстановлении баланса: {e}")
 
     def reload_providers(self) -> str:
+        with self._provider_lock:
+            return self._reload_providers_locked()
+
+    def _reload_providers_locked(self) -> str:
         """Пересоздаёт Fragment/кошелёк/tonapi по текущему конфигу. Возвращает статус-текст."""
         lines = []
         self.tonapi.token = self.config.get("ton_api_token") or None
@@ -932,6 +1254,7 @@ class AutoStarsService:
         if self.config.get("ton_mnemonic"):
             try:
                 self.wallet = Wallet.from_mnemonic(self.config["ton_mnemonic"], self.tonapi)
+                self.wallet._min_seqno = self.storage.get_confirmed_seqno(self.wallet.address)
                 balance = self.wallet.get_balance()
                 lines.append(f"✅ Кошелёк: <code>{self.wallet.address}</code>\n"
                              f"💰 Баланс: {balance / ONE_TON} TON")
@@ -967,9 +1290,7 @@ def load_config() -> dict:
 
 
 def save_config(cfg: dict) -> None:
-    os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, ensure_ascii=False, indent=2)
+    _atomic_write_json(CONFIG_PATH, cfg)
 
 
 CONFIG: dict | None = None
@@ -1064,7 +1385,9 @@ def register_settings(cardinal: "Cardinal", *args) -> None:
             fr = "✅" if SERVICE.fragment else "❌"
             wl = "✅" if SERVICE.wallet else "❌"
             pause = " · ⏸ пауза: низкий баланс" if SERVICE._low_balance_paused else ""
-            status = f"Fragment {fr} · Кошелёк {wl}{pause}"
+            pending = len(SERVICE.storage.get_pending_orders())
+            payment_pause = f" · ⏳ ждём результат платежа ({pending} заказов)" if pending else ""
+            status = f"Fragment {fr} · Кошелёк {wl}{pause}{payment_pause}"
         elif not PYTONIQ_AVAILABLE:
             status = "❌ не установлен pytoniq (pip install pytoniq)"
         return (f"<b>⭐ AutoStars — настройки</b>\n\n"
@@ -1094,6 +1417,9 @@ def register_settings(cardinal: "Cardinal", *args) -> None:
         if SERVICE is not None:
             SERVICE._bot = bot
             SERVICE._admin_chat_id = c.message.chat.id
+            cfg = _ensure_config()
+            cfg["admin_chat_id"] = c.message.chat.id
+            save_config(cfg)
         render(c, offset)
         bot.answer_callback_query(c.id)
 
