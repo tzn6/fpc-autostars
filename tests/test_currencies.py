@@ -86,6 +86,8 @@ class Network:
         self.trace_visible = False
         self.fail_recipient = False
         self.invalid_trace_amount = False
+        self.notification_skipped = None
+        self.notification_bounce = False
         self.transfers = []
 
     def get_wallet(self, address_):
@@ -103,12 +105,16 @@ class Network:
         for index, transfer in enumerate(self.transfers):
             query, amount, recipient, _ = p._jetton_fields(transfer["body"], 0x0F8A7EA5)
             root_message = {"hash": f"root-{index}", "destination": {"address": transfer["address"]},
+                            "source": {"address": self.owner}, "bounce": True,
                             "value": transfer["amount"], "raw_body": transfer["body"].to_boc().hex(),
                             "msg_type": "int_msg", "bounced": False}
             internal = {"hash": f"internal-{index}", "destination": {"address": self.recipient_jetton},
+                        "source": {"address": self.jetton_wallet}, "bounce": True, "value": 10_000_000,
                         "raw_body": cell(0x178D4519, query, amount, self.owner).to_boc().hex(),
                         "msg_type": "int_msg", "bounced": False}
             notification = {"hash": f"notification-{index}", "destination": {"address": recipient},
+                            "source": {"address": self.recipient_jetton},
+                            "bounce": self.notification_bounce, "value": 1,
                             "raw_body": cell(0x7362D09C, query,
                                              amount + int(self.invalid_trace_amount), self.owner).to_boc().hex(),
                             "msg_type": "int_msg", "bounced": False}
@@ -118,14 +124,21 @@ class Network:
                                         "success": success, "aborted": not success, "out_msgs": outgoing},
                         "children": children_}
 
-            delivered = node(recipient, notification, [], [])
-            receiver = node(self.recipient_jetton, internal, [notification], [delivered], not self.fail_recipient)
-            sender = node(self.jetton_wallet, root_message, [internal], [receiver])
+            delivered = node(recipient, notification, [], [], not bool(self.notification_skipped))
+            if self.notification_skipped:
+                delivered["transaction"].update(
+                    orig_status="uninit" if self.notification_skipped == "cskip_no_state" else "active",
+                    end_status="uninit" if self.notification_skipped == "cskip_no_state" else "active",
+                    compute_phase={"skipped": True, "skip_reason": self.notification_skipped},
+                    credit_phase={"credit": 1, "fees_collected": 0})
+            # TonAPI places consumed messages in child in_msg entries in the trace.
+            receiver = node(self.recipient_jetton, internal, [], [delivered], not self.fail_recipient)
+            sender = node(self.jetton_wallet, root_message, [], [receiver])
             root_messages.append(root_message)
             children.append(sender)
         self.tx = {"hash": "transaction-hash", "account": {"address": self.owner},
                    "success": True, "aborted": False, "out_msgs": root_messages}
-        self.trace = {"transaction": self.tx, "children": children}
+        self.trace = {"transaction": {**self.tx, "out_msgs": []}, "children": children}
         self.seqno += 1
 
     def get_transaction_by_message_hash(self, message_hash):
@@ -296,6 +309,96 @@ class CurrencyTests(unittest.TestCase):
         self.assertEqual(self.s.cardinal.refunds, [])
         self.assertEqual(self.s.cardinal.messages, [])
 
+    def test_credited_nonbounce_notification_with_no_gas_completes_order(self):
+        self.api.trace_visible = True
+        self.api.notification_skipped = "cskip_no_gas"
+        self.start(helpers.order())
+        self.assertEqual(self.s.storage.get("O1")["status"], p.ST_DONE)
+        self.assertEqual(len(self.s.cardinal.messages), 1)
+        self.assertEqual(len(self.api.broadcasts), 1)
+
+    def test_credited_uninitialized_notification_completes_order(self):
+        self.api.trace_visible = True
+        self.api.notification_skipped = "cskip_no_state"
+        self.start(helpers.order())
+        self.assertEqual(self.s.storage.get("O1")["status"], p.ST_DONE)
+        self.assertEqual(len(self.s.cardinal.messages), 1)
+
+    def test_bounceable_failed_notification_never_confirms_order(self):
+        self.api.trace_visible = True
+        self.api.notification_skipped = "cskip_no_gas"
+        self.api.notification_bounce = True
+        self.start(helpers.order())
+        self.assertNotEqual(self.s.storage.get("O1")["status"], p.ST_DONE)
+        self.assertEqual(self.s.cardinal.messages, [])
+
+    def test_skipped_notification_without_full_credit_does_not_confirm(self):
+        self.api.notification_skipped = "cskip_no_gas"
+        self.start(helpers.order())
+        delivered = self.api.trace["children"][0]["children"][0]["children"][0]
+        delivered["transaction"]["credit_phase"]["credit"] = 0
+        self.api.trace_visible = True
+        self.s._reconcile_pending()
+        self.assertNotEqual(self.s.storage.get("O1")["status"], p.ST_DONE)
+        self.assertEqual(self.s.cardinal.messages, [])
+        self.assertEqual(self.s.cardinal.refunds, [])
+
+    def test_skipped_bad_state_does_not_confirm(self):
+        self.api.notification_skipped = "cskip_bad_state"
+        self.api.trace_visible = True
+        self.start(helpers.order())
+        self.assertNotEqual(self.s.storage.get("O1")["status"], p.ST_DONE)
+        self.assertEqual(self.s.cardinal.messages, [])
+        self.assertEqual(self.s.cardinal.refunds, [])
+
+    def test_emulated_child_is_not_confirmation(self):
+        self.start(helpers.order())
+        self.api.trace["children"][0]["children"][0]["emulated"] = True
+        self.api.trace_visible = True
+        self.s._reconcile_pending()
+        self.assertEqual(self.s.storage.get("O1")["status"], p.ST_TRANSFERRING)
+        self.assertEqual(self.s.cardinal.messages, [])
+        self.assertEqual(self.s.cardinal.refunds, [])
+
+    def test_skipped_jetton_wallet_execution_does_not_confirm(self):
+        self.start(helpers.order())
+        receiver = self.api.trace["children"][0]["children"][0]
+        receiver["transaction"]["compute_phase"] = {"skipped": True, "skip_reason": "cskip_no_state"}
+        self.api.trace_visible = True
+        self.s._reconcile_pending()
+        self.assertNotEqual(self.s.storage.get("O1")["status"], p.ST_DONE)
+        self.assertEqual(self.s.cardinal.messages, [])
+        self.assertEqual(self.s.cardinal.refunds, [])
+
+    def test_missing_notification_keeps_payment_pending(self):
+        self.start(helpers.order())
+        self.api.trace["children"][0]["children"][0]["children"] = []
+        self.api.trace_visible = True
+        self.s._reconcile_pending()
+        self.assertEqual(self.s.storage.get("O1")["status"], p.ST_TRANSFERRING)
+        self.assertEqual(self.s.cardinal.messages, [])
+        self.assertEqual(self.s.cardinal.refunds, [])
+
+    def test_duplicate_notification_is_not_used_as_proof(self):
+        self.start(helpers.order())
+        receiver = self.api.trace["children"][0]["children"][0]
+        receiver["children"].append(copy.deepcopy(receiver["children"][0]))
+        self.api.trace_visible = True
+        self.s._reconcile_pending()
+        self.assertEqual(self.s.storage.get("O1")["status"], p.ST_TRANSFERRING)
+        self.assertEqual(self.s.cardinal.messages, [])
+        self.assertEqual(self.s.cardinal.refunds, [])
+
+    def test_forged_source_does_not_confirm_or_refund(self):
+        self.start(helpers.order())
+        sender = self.api.trace["children"][0]
+        sender["children"][0]["transaction"]["in_msg"]["source"]["address"] = address(9)
+        self.api.trace_visible = True
+        self.s._reconcile_pending()
+        self.assertNotEqual(self.s.storage.get("O1")["status"], p.ST_DONE)
+        self.assertEqual(self.s.cardinal.messages, [])
+        self.assertEqual(self.s.cardinal.refunds, [])
+
     def test_wrong_notification_does_not_confirm_payment(self):
         self.api.trace_visible = True
         self.api.invalid_trace_amount = True
@@ -304,6 +407,7 @@ class CurrencyTests(unittest.TestCase):
         self.assertEqual(self.s.cardinal.messages, [])
 
     def test_pending_usdt_recovers_after_restart_and_late_trace(self):
+        self.api.notification_skipped = "cskip_no_gas"
         self.start(helpers.order())
         restarted = copy.copy(self.s)
         restarted.storage = p.Storage(self.s.storage.path)
@@ -316,6 +420,10 @@ class CurrencyTests(unittest.TestCase):
         self.api.trace_visible = True
         restarted._reconcile_pending()
         self.assertEqual(restarted.storage.get("O1")["status"], p.ST_DONE)
+        self.assertEqual(len(self.api.broadcasts), 1)
+        self.assertEqual(len(self.s.cardinal.messages), 1)
+        restarted._reconcile_pending()
+        self.assertEqual(len(self.s.cardinal.messages), 1)
         self.assertEqual(len(self.api.broadcasts), 1)
 
     def test_rejects_other_jetton_wallet_and_non_jetton_payload(self):
