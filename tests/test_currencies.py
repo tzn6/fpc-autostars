@@ -1,5 +1,6 @@
 """Currency selection and real TEP-74 cells, with a simulated TON network."""
 import base64
+import binascii
 import copy
 import pathlib
 import sys
@@ -167,6 +168,73 @@ class CurrencyTests(unittest.TestCase):
             self.assertEqual(post.call_args.args[0]["payment_method"], "usdt_ton")
             with self.assertRaises(p.FragmentError):
                 fragment.init_buy_stars_request("recipient", 50, "BTC")
+
+    def test_base64_decoder_accepts_standard_and_urlsafe_without_losing_bytes(self):
+        raw = b"\xfb\xff\xff\x00\xfe"
+        for encoded in (base64.b64encode(raw).decode(), base64.urlsafe_b64encode(raw).decode()):
+            for payload in (encoded, encoded.rstrip("=")):
+                with self.subTest(payload=payload):
+                    self.assertEqual(p._decode_fragment_payload(payload), raw)
+        for payload in ("a", "bad*chars", "%%%", "AA==junk", "", "☃"):
+            with self.subTest(payload=payload):
+                with self.assertRaises(ValueError):
+                    p._decode_fragment_payload(payload)
+
+    def test_urlsafe_usdt_quote_reproduces_181_character_error(self):
+        body = (p.begin_cell().store_uint(0x0F8A7EA5, 32).store_uint(0, 64)
+                .store_coins(2 * p.ONE_USDT).store_address(p.Address(self.api.recipient))
+                .store_address(p.Address(self.api.owner)).store_bit(0).store_coins(1).store_bit(1)
+                .store_ref(p.begin_cell().store_uint(0, 32)
+                           .store_snake_string("Ref#" + "X" * 28).end_cell()).end_cell())
+        payload = base64.urlsafe_b64encode(body.to_boc()).decode().rstrip("=")
+        self.assertIn("-", payload)
+        with self.assertRaisesRegex(binascii.Error, "181"):
+            base64.b64decode(p._pad_b64(payload))
+        self.s.fragment.body_override = body
+        original_link = self.s.fragment.get_buy_stars_link
+
+        def urlsafe_link(*args):
+            link = original_link(*args)
+            link["transaction"]["messages"][0]["payload"] = payload
+            return link
+
+        self.s.fragment.get_buy_stars_link = urlsafe_link
+        self.api.trace_visible = True
+        self.start(helpers.order())
+        self.assertEqual(self.s.storage.get("O1")["status"], p.ST_DONE)
+        self.assertEqual(len(self.api.broadcasts), 1)
+        self.assertEqual(self.api.transfers[0]["body"].hash, body.hash)
+
+    def test_urlsafe_ton_quote_preserves_reference_and_payload(self):
+        body = p.begin_cell().store_uint(0, 32).store_snake_string("Ref#" + "X" * 116).end_cell()
+        payload = base64.urlsafe_b64encode(body.to_boc()).decode().rstrip("=")
+        self.assertIn("-", payload)
+        with self.assertRaises(binascii.Error):
+            base64.b64decode(p._pad_b64(payload))
+        self.s.config["show_ad"] = False
+        link = {"transaction": {"validUntil": int(p.time.time()) + 300, "messages": [{
+            "address": address(9), "amount": str(p.ONE_TON), "payload": payload,
+        }]}}
+        with mock.patch.object(self.s.fragment, "get_buy_stars_link", return_value=link):
+            current = helpers.order()
+            transfer = self.s._prepare_transfer(current, "TON")
+        self.assertIsNotNone(transfer)
+        self.assertEqual(transfer["body"].hash, body.hash)
+        self.assertEqual(current["ref"], "Ref#" + "X" * 116)
+
+    def test_invalid_base64_does_not_broadcast_or_damage_payment_history(self):
+        original_link = self.s.fragment.get_buy_stars_link
+
+        def invalid_link(*args):
+            link = original_link(*args)
+            link["transaction"]["messages"][0]["payload"] = "broken*payload"
+            return link
+
+        self.s.fragment.get_buy_stars_link = invalid_link
+        self.start(helpers.order())
+        self.assertEqual(self.s.storage.get("O1")["error"], p.ERR_UNABLE_TO_FETCH_LINK)
+        self.assertNotIn("payment_attempt", self.s.storage.get("O1"))
+        self.assertEqual(self.api.broadcasts, [])
 
     def test_confirmation_sends_saved_boc_and_wallet_account(self):
         fragment = p.FragmentAPI("cookies", "hash")

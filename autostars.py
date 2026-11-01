@@ -30,6 +30,7 @@ import re
 import json
 import time
 import base64
+import binascii
 import copy
 import html
 import logging
@@ -62,7 +63,7 @@ except Exception as e:  # noqa: BLE001
 # ============================== МЕТА-ДАННЫЕ ПЛАГИНА ==============================
 
 NAME = "AutoStars"
-VERSION = "0.4.1"
+VERSION = "0.4.2"
 DESCRIPTION = (
     "Автовыдача Telegram Stars: покупка звёзд через Fragment и оплата с "
     "TON-кошелька W5. Требует: pip install pytoniq."
@@ -323,6 +324,8 @@ def payment_error_detail(stage: str, error: Exception) -> str:
                 "В платеже USDT отсутствует комиссия для уведомления получателя.",
             "Fragment вернул неизвестные параметры подтверждения.":
                 "Fragment вернул неизвестные параметры подтверждения.",
+            "Некорректная кодировка Base64 платёжных данных.":
+                "Fragment вернул платёжные данные с неверной кодировкой Base64.",
             "unexpected jetton opcode": "В ответе Fragment неверная команда перевода USDT.",
             "invalid jetton amount or address": "В ответе Fragment неверные сумма или адрес перевода USDT.",
         }
@@ -446,19 +449,34 @@ def _pad_b64(b64: str) -> str:
     return b64 + "=" * (4 - pad) if pad else b64
 
 
+def _decode_fragment_payload(payload_b64: str) -> bytes:
+    """Decode standard or URL-safe Base64 without silently discarding bytes."""
+    if not isinstance(payload_b64, str) or not payload_b64.strip():
+        raise ValueError("Некорректная кодировка Base64 платёжных данных.")
+    normalized = payload_b64.strip().replace("-", "+").replace("_", "/")
+    try:
+        decoded = base64.b64decode(_pad_b64(normalized), validate=True)
+        if not decoded:
+            raise ValueError("empty payload")
+        return decoded
+    except (binascii.Error, ValueError) as e:
+        raise ValueError("Некорректная кодировка Base64 платёжных данных.") from e
+
+
 def extract_ref(payload_b64: str) -> str | None:
     """Достаёт реф-код 'Ref#...' из payload Fragment (для альтернативного комментария)."""
     if not payload_b64:
         return None
+    payload = _decode_fragment_payload(payload_b64)
     try:
-        cell = Cell.one_from_boc(base64.b64decode(_pad_b64(payload_b64)))
+        cell = Cell.one_from_boc(payload)
         text = cell.begin_parse().load_snake_string()
         m = re.search(r"Ref#.+", text)
         if m:
             return re.sub(r"[^A-Za-z0-9:#]", "", m.group())
     except Exception:  # noqa: BLE001
         pass
-    raw = base64.b64decode(_pad_b64(payload_b64)).decode("latin1", "ignore")
+    raw = payload.decode("latin1", "ignore")
     m = re.search(r"Ref#[A-Za-z0-9:#]+", raw)
     return re.sub(r"[^A-Za-z0-9:#]", "", m.group()) if m else None
 
@@ -1606,7 +1624,7 @@ class AutoStarsService:
             return begin_cell().store_uint(0, 32).store_snake_string(
                 f"{AD_TEXT}\n\n{order['ref']}"
             ).end_cell()
-        return Cell.one_from_boc(base64.b64decode(_pad_b64(msg["payload"])))
+        return Cell.one_from_boc(_decode_fragment_payload(msg["payload"]))
 
     def _fail(self, orders: list[dict], error: str) -> None:
         for order in orders:
