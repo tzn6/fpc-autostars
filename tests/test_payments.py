@@ -135,6 +135,7 @@ class FakeTonAPI(p.TonAPI):
 class FakeFragment:
     def __init__(self):
         self.calls = []
+        self.currencies = []
         self.broken = False
         self.multiple_messages = False
         self.lookups = []
@@ -145,8 +146,9 @@ class FakeFragment:
             raise p.FragmentError("searchStarsRecipient", "No Telegram users found.")
         return {"recipient": "recipient:" + username}
 
-    def init_buy_stars_request(self, recipient, quantity):
+    def init_buy_stars_request(self, recipient, quantity, currency="TON"):
         self.calls.append((recipient, quantity))
+        self.currencies.append(currency)
         if self.broken:
             raise p.FragmentError("initBuyStarsRequest", "HTTP 503")
         return {"req_id": "r" + str(len(self.calls))}
