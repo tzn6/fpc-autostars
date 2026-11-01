@@ -63,7 +63,7 @@ except Exception as e:  # noqa: BLE001
 # ============================== МЕТА-ДАННЫЕ ПЛАГИНА ==============================
 
 NAME = "AutoStars"
-VERSION = "0.4.2"
+VERSION = "0.4.3"
 DESCRIPTION = (
     "Автовыдача Telegram Stars: покупка звёзд через Fragment и оплата с "
     "TON-кошелька W5. Требует: pip install pytoniq."
@@ -783,29 +783,53 @@ def _jetton_fields(body, opcode: int) -> tuple[int, int, str, Any]:
     return query_id, amount, address.to_str(is_user_friendly=False), parsed
 
 
+def _trace_address(value: Any) -> str:
+    if isinstance(value, dict):
+        value = value["address"]
+    if not isinstance(value, str) or not value:
+        raise ValueError("invalid trace address")
+    return Address(value).to_str(is_user_friendly=False)
+
+
+def _trace_children(node: dict) -> list[tuple[dict, dict]]:
+    """TonAPI moves consumed out_msgs into the child transaction's in_msg."""
+    try:
+        if node.get("emulated") is True:
+            return []
+        parent = _trace_address(node["transaction"]["account"])
+        children = node.get("children", [])
+        if not isinstance(children, list):
+            return []
+    except Exception:  # noqa: BLE001 - incomplete trace
+        return []
+    links = []
+    for child in children:
+        try:
+            transaction = child["transaction"]
+            incoming = transaction["in_msg"]
+            if (incoming.get("msg_type") != "int_msg" or incoming.get("bounced") is not False
+                    or not isinstance(incoming.get("hash"), str) or not incoming["hash"]
+                    or _trace_address(incoming["source"]) != parent
+                    or _trace_address(incoming["destination"]) != _trace_address(transaction["account"])):
+                continue
+            links.append((incoming, child))
+        except Exception:  # noqa: BLE001 - malformed child cannot confirm a payment
+            continue
+    return links
+
+
 def _trace_child(node: dict, message: dict) -> dict | None:
     """Find the transaction consuming this exact internal message."""
-    msg_hash = message.get("hash")
-    if not msg_hash:
-        return None
-    children = node.get("children", [])
-    if not isinstance(children, list):
-        return None
-    matches = [child for child in children if isinstance(child, dict)
-               and (child.get("transaction") or {}).get("in_msg", {}).get("hash") == msg_hash]
-    if len(matches) != 1:
-        return None
-    child = matches[0]
     try:
-        dest = message["destination"]
-        if isinstance(dest, dict):
-            dest = dest["address"]
-        account = child["transaction"]["account"]["address"]
-        if Address(dest).to_str(is_user_friendly=False) != Address(account).to_str(is_user_friendly=False):
+        msg_hash = message["hash"]
+        destination = _trace_address(message["destination"])
+        if not isinstance(msg_hash, str) or not msg_hash:
             return None
-    except (KeyError, TypeError, ValueError):
+        matches = [child for incoming, child in _trace_children(node)
+                   if incoming["hash"] == msg_hash and _trace_address(incoming["destination"]) == destination]
+        return matches[0] if len(matches) == 1 else None
+    except Exception:  # noqa: BLE001
         return None
-    return child
 
 
 def _trace_success(node: dict) -> bool | None:
@@ -814,10 +838,40 @@ def _trace_success(node: dict) -> bool | None:
     tx = node.get("transaction") or {}
     if not isinstance(tx.get("success"), bool) or not isinstance(tx.get("aborted"), bool):
         return None
-    if not tx["success"] or tx["aborted"] or (tx.get("compute_phase") or {}).get("success") is False \
+    if not tx["success"] or tx["aborted"] or (tx.get("compute_phase") or {}).get("skipped") is True \
+            or (tx.get("compute_phase") or {}).get("success") is False \
             or (tx.get("action_phase") or {}).get("success") is False:
         return False
     return True
+
+
+def _notification_received(node: dict) -> bool | None:
+    """A non-bounceable message can be credited even when compute is skipped."""
+    status = _trace_success(node)
+    if status is not False:
+        return status
+    try:
+        tx = node["transaction"]
+        message = tx["in_msg"]
+        compute = tx["compute_phase"]
+        credit = tx["credit_phase"]["credit"]
+        value = message["value"]
+        # A one-nanoton jetton notification commonly has no gas for contract execution.
+        # Only accept a non-bounced, fully credited notification with no bounce/actions.
+        if (message.get("bounce") is False and message.get("bounced") is False
+                and tx.get("success") is False and tx.get("aborted") is True
+                and tx.get("orig_status") in ("active", "uninit", "nonexist")
+                and tx.get("end_status") in ("active", "uninit", "nonexist")
+                and compute.get("skipped") is True
+                and compute.get("skip_reason") in ("cskip_no_gas", "cskip_no_state")
+                and isinstance(value, int) and not isinstance(value, bool) and value > 0
+                and isinstance(credit, int) and not isinstance(credit, bool) and credit == value
+                and tx.get("bounce_phase") is None and tx.get("action_phase") is None
+                and tx.get("out_msgs") == [] and not node.get("children")):
+            return True
+    except Exception:  # noqa: BLE001 - incomplete notification cannot confirm a payment
+        pass
+    return False
 
 
 def _verify_usdt_trace(trace: dict | None, root_tx: dict, message: dict, expected: dict,
@@ -832,12 +886,10 @@ def _verify_usdt_trace(trace: dict | None, root_tx: dict, message: dict, expecte
     if status is not True:
         return status
 
-    # Follow the actual sender-jetton-wallet -> receiver-jetton-wallet message.
-    sender_tx = wallet["transaction"]
-    for internal in sender_tx.get("out_msgs", []):
+    # Follow consumed in_msg records: completed messages are absent from out_msgs in a trace.
+    receivers = []
+    for internal, receiver in _trace_children(wallet):
         try:
-            if internal.get("msg_type") != "int_msg" or internal.get("bounced") is not False:
-                continue
             body = Cell.one_from_boc(bytes.fromhex(internal["raw_body"]))
             query, amount, sender, _ = _jetton_fields(body, 0x178D4519)
             if (query, amount, sender) != (expected["jetton_query_id"], expected["jetton_amount"],
@@ -845,29 +897,26 @@ def _verify_usdt_trace(trace: dict | None, root_tx: dict, message: dict, expecte
                 continue
         except Exception:  # noqa: BLE001
             continue
-        receiver = _trace_child(wallet, internal)
-        if not receiver:
-            return None
-        status = _trace_success(receiver)
-        if status is not True:
-            return status
-        for notification in receiver["transaction"].get("out_msgs", []):
-            try:
-                dest = notification["destination"]
-                if isinstance(dest, dict):
-                    dest = dest["address"]
-                body = Cell.one_from_boc(bytes.fromhex(notification["raw_body"]))
-                query, amount, sender, _ = _jetton_fields(body, 0x7362D09C)
-                if (notification.get("msg_type") != "int_msg" or notification.get("bounced") is not False
-                        or Address(dest).to_str(is_user_friendly=False) != expected["jetton_recipient"]
-                        or (query, amount, sender) != (expected["jetton_query_id"], expected["jetton_amount"],
-                                                        Address(wallet_address).to_str(is_user_friendly=False))):
-                    continue
-            except Exception:  # noqa: BLE001
+        receivers.append(receiver)
+    if len(receivers) != 1:
+        return None
+    receiver = receivers[0]
+    status = _trace_success(receiver)
+    if status is not True:
+        return status
+    notifications = []
+    for notification, delivered in _trace_children(receiver):
+        try:
+            body = Cell.one_from_boc(bytes.fromhex(notification["raw_body"]))
+            query, amount, sender, _ = _jetton_fields(body, 0x7362D09C)
+            if (_trace_address(notification["destination"]) != expected["jetton_recipient"]
+                    or (query, amount, sender) != (expected["jetton_query_id"], expected["jetton_amount"],
+                                                    Address(wallet_address).to_str(is_user_friendly=False))):
                 continue
-            delivered = _trace_child(receiver, notification)
-            return _trace_success(delivered) if delivered else None
-    return None
+            notifications.append(delivered)
+        except Exception:  # noqa: BLE001
+            continue
+    return _notification_received(notifications[0]) if len(notifications) == 1 else None
 
 
 # ============================== Разбор заказа ==============================
