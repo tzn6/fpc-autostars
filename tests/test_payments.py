@@ -570,6 +570,44 @@ class PaymentTests(unittest.TestCase):
         self.assertEqual(self.s.cardinal.refunds, ["O1"])
         self.assertEqual(len(self.s.cardinal.messages), 1)
         self.assertEqual(len(self.s.cardinal.notifications), 1)
+        self.assertIn("Создание заявки в Fragment", self.s.cardinal.notifications[0][1])
+        self.assertIn("HTTP 503", self.s.cardinal.notifications[0][1])
+
+    def test_fragment_reports_wallet_or_verification_required(self):
+        api = p.FragmentAPI("cookie", "hash")
+        for flag in ("need_ton", "need_verify"):
+            with self.subTest(flag=flag):
+                response = types.SimpleNamespace(status_code=200, json=lambda: {flag: True})
+                with mock.patch.object(p.requests, "post", return_value=response, create=True):
+                    with self.assertRaises(p.FragmentError) as raised:
+                        api.init_buy_stars_request("recipient", 50, "USDT")
+                self.assertEqual(raised.exception.error_text, flag)
+
+    def test_payment_error_shows_stage_without_exposing_server_text(self):
+        self.s.config["refund_on_error"] = False
+        secret = "cookie_or_hash_should_never_appear"
+        self.s.fragment.init_buy_stars_request = mock.Mock(
+            side_effect=p.FragmentError("initBuyStarsRequest", f"Unexpected failure {secret}"))
+        broken_order = order()
+        broken_order["retries_left"] = 0
+        self.s._transfer_batch([broken_order])
+        saved = self.s.storage.get("O1")
+        self.assertEqual(saved["error"], p.ERR_UNABLE_TO_FETCH_LINK)
+        self.assertIn("Создание заявки в Fragment", saved["payment_error_detail"])
+        notification = self.s.cardinal.notifications[0][1]
+        self.assertIn("Создание заявки в Fragment", notification)
+        self.assertNotIn(secret, notification)
+        self.assertNotIn(secret, self.s.cardinal.messages[0][1])
+        self.assertEqual(self.s.tonapi.broadcasts, [])
+
+    def test_successful_retry_clears_old_diagnostic(self):
+        current = order()
+        self.s.fragment.broken = True
+        self.assertIsNone(self.s._prepare_transfer(current))
+        self.assertIn("payment_error_detail", current)
+        self.s.fragment.broken = False
+        self.assertIsNotNone(self.s._prepare_transfer(current))
+        self.assertNotIn("payment_error_detail", current)
 
     def test_refund_timeout_is_not_retried_automatically(self):
         def refund(order_id):

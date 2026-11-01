@@ -62,7 +62,7 @@ except Exception as e:  # noqa: BLE001
 # ============================== МЕТА-ДАННЫЕ ПЛАГИНА ==============================
 
 NAME = "AutoStars"
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 DESCRIPTION = (
     "Автовыдача Telegram Stars: покупка звёзд через Fragment и оплата с "
     "TON-кошелька W5. Требует: pip install pytoniq."
@@ -227,7 +227,13 @@ class FragmentAPI:
             data = resp.json()
         except Exception as e:  # noqa: BLE001
             raise FragmentError(payload.get("method", "?"), "invalid JSON") from e
-        if data and data.get("error"):
+        if not isinstance(data, dict):
+            raise FragmentError(payload.get("method", "?"), "invalid JSON object")
+        if data.get("need_verify"):
+            raise FragmentError(payload.get("method", "?"), "need_verify")
+        if data.get("need_ton"):
+            raise FragmentError(payload.get("method", "?"), "need_ton")
+        if data.get("error"):
             raise FragmentError(payload.get("method", "?"), str(data["error"]))
         return data
 
@@ -281,6 +287,58 @@ class FragmentAPI:
                        boc=base64.b64encode(bytes.fromhex(boc)).decode("ascii"))
         if self._post(payload).get("ok") is not True:
             raise FragmentError(method, "confirmation not accepted")
+
+
+def payment_error_detail(stage: str, error: Exception) -> str:
+    """Safe, bounded diagnostics: never expose server text, URLs or credentials."""
+    if isinstance(error, FragmentError):
+        reason = error.error_text
+        known = {
+            "need_verify": "Fragment требует пройти проверку аккаунта или кошелька.",
+            "need_ton": "Fragment просит подключить TON-кошелёк к аккаунту.",
+            "invalid JSON": "Fragment вернул некорректный ответ JSON.",
+            "invalid JSON object": "Fragment вернул ответ неожиданного формата.",
+            "no req_id": "Fragment не вернул идентификатор заявки.",
+            "no transaction in response": "Fragment не вернул транзакцию для оплаты.",
+            "expected exactly one payment message": "Fragment вернул неожиданное количество платёжных сообщений.",
+            "payment amount must be positive": "Fragment вернул некорректную сумму платежа.",
+        }
+        if reason in known:
+            description = known[reason]
+        elif re.fullmatch(r"HTTP [1-5][0-9]{2}", reason):
+            description = f"Fragment вернул {reason}."
+        elif any(word in reason.casefold() for word in ("access denied", "unauthorized", "unauthorised")):
+            description = "Fragment отклонил авторизацию; проверьте cookies и hash."
+        else:
+            description = "Fragment отклонил запрос; точная причина в журнале FPC."
+    else:
+        exceptions = getattr(requests, "exceptions", None)
+        known_values = {
+            "Отправитель Fragment не совпадает с кошельком.": "Отправитель Fragment не совпадает с кошельком.",
+            "Fragment вернул неподдерживаемый stateInit для платежа USDT.":
+                "Fragment вернул неподдерживаемый stateInit для платежа USDT.",
+            "Адрес USDT-кошелька не совпадает с кошельком владельца.":
+                "Адрес USDT-кошелька не совпадает с кошельком владельца.",
+            "В платеже USDT отсутствует комиссия для уведомления получателя.":
+                "В платеже USDT отсутствует комиссия для уведомления получателя.",
+            "Fragment вернул неизвестные параметры подтверждения.":
+                "Fragment вернул неизвестные параметры подтверждения.",
+            "unexpected jetton opcode": "В ответе Fragment неверная команда перевода USDT.",
+            "invalid jetton amount or address": "В ответе Fragment неверные сумма или адрес перевода USDT.",
+        }
+        if exceptions is not None and isinstance(error, exceptions.Timeout):
+            description = "Истекло время ожидания ответа Fragment."
+        elif exceptions is not None and isinstance(error, exceptions.ConnectionError):
+            description = "Не удалось подключиться к Fragment."
+        elif isinstance(error, ValueError) and str(error) in known_values:
+            description = known_values[str(error)]
+        elif isinstance(error, KeyError) and error.args and error.args[0] in {
+            "transaction", "messages", "amount", "address", "validUntil", "payload", "req_id"
+        }:
+            description = f"В ответе Fragment отсутствует поле {error.args[0]}."
+        else:
+            description = "Не удалось обработать данные платежа; подробности в журнале FPC."
+    return f"{stage}: {description}"
 
 
 # ============================== tonapi.io ==============================
@@ -1484,18 +1542,23 @@ class AutoStarsService:
             self._mark_for_review(awaiting, "Перевод USDT или подтверждение Fragment пока не завершены.")
 
     def _prepare_transfer(self, order: dict, currency: str = "TON", jetton_wallet: str | None = None) -> dict | None:
+        stage = "Создание заявки в Fragment"
         try:
             req = self.fragment.init_buy_stars_request(order["recipient_id"], order["stars_amount"], currency)
+            stage = "Подготовка кошелька"
             account = self.wallet.offline.tonconnect_account() if currency == "USDT" else None
+            stage = "Получение платёжных данных Fragment"
             if account is None:
                 link = self.fragment.get_buy_stars_link(req["req_id"], self.config.get("show_sender", False))
             else:
                 link = self.fragment.get_buy_stars_link(req["req_id"], self.config.get("show_sender", False), account)
+                stage = "Проверка платёжных данных"
                 sender = link["transaction"].get("from")
                 if sender and Address(sender).to_str(is_user_friendly=False) != Address(
                     self.wallet.address
                 ).to_str(is_user_friendly=False):
                     raise ValueError("Отправитель Fragment не совпадает с кошельком.")
+            stage = "Проверка платёжных данных"
             if len(link["transaction"]["messages"]) != 1:
                 raise FragmentError("getBuyStarsLink", "expected exactly one payment message")
             msg = link["transaction"]["messages"][0]
@@ -1528,11 +1591,13 @@ class AutoStarsService:
                     if link["confirm_method"] != "confirmReq" or not isinstance(params, dict):
                         raise ValueError("Fragment вернул неизвестные параметры подтверждения.")
                     result.update(confirm_method=link["confirm_method"], confirm_params=params)
+            order.pop("payment_error_detail", None)
             return result
         except Exception as e:  # noqa: BLE001
             logger.error(f"{LOGGER_PREFIX} Ошибка получения ссылки Fragment "
                          f"по заказу {order['order_id']}: {e}")
             order["status"], order["error"] = ST_ERROR, ERR_UNABLE_TO_FETCH_LINK
+            order["payment_error_detail"] = payment_error_detail(stage, e)
             return None
 
     def _build_body(self, order: dict, msg: dict, currency: str = "TON"):
@@ -1564,9 +1629,11 @@ class AutoStarsService:
         self._send(order, format_message(msgs.get("transaction_failed", ""), order))
         logger.error(f"{LOGGER_PREFIX} Заказ {order['order_id']} провалился: "
                      f"{ERROR_DESC.get(order['error'], order['error'])}.")
+        detail = order.get("payment_error_detail") if order.get("error") == ERR_UNABLE_TO_FETCH_LINK else None
         self._notify_admin(
             f"❌ <b>AutoStars: ошибка заказа {html.escape(order['order_id'])}</b>\n"
             f"{html.escape(ERROR_DESC.get(order['error'], order['error']))}"
+            + (f"\n\n<b>Причина:</b> {html.escape(detail)}" if detail else "")
         )
         if self.config.get("refund_on_error"):
             self._refund(order)
