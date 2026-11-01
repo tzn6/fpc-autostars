@@ -62,6 +62,7 @@ class CurrencyFragment:
 class Offline:
     def __init__(self, api):
         self.api = api
+        self.seqnos = []
 
     def address_str(self):
         return self.api.owner
@@ -70,8 +71,10 @@ class Offline:
         return {"address": self.api.owner, "chain": "-239", "walletStateInit": "AA==", "publicKey": "00"}
 
     def build_external_transfer(self, seqno, transfers):
+        self.seqnos.append(seqno)
         self.api.transfers = transfers
-        return "00aabb", "message-hash"
+        self.api.current_message_hash = f"message-hash-{seqno}"
+        return "00aabb", self.api.current_message_hash
 
 
 class Network:
@@ -80,7 +83,10 @@ class Network:
         self.balance = 100 * p.ONE_TON
         self.usdt = 10 * p.ONE_USDT
         self.seqno = 7
+        self.cached_seqno = None
         self.broadcasts = []
+        self.transactions = {}
+        self.traces = {}
         self.tx = None
         self.trace = None
         self.trace_visible = False
@@ -97,7 +103,7 @@ class Network:
         return self.usdt, self.jetton_wallet if self.usdt else None
 
     def get_seqno(self, address_):
-        return self.seqno
+        return self.seqno if self.cached_seqno is None else self.cached_seqno
 
     def send_boc(self, boc):
         self.broadcasts.append(boc)
@@ -136,16 +142,18 @@ class Network:
             sender = node(self.jetton_wallet, root_message, [], [receiver])
             root_messages.append(root_message)
             children.append(sender)
-        self.tx = {"hash": "transaction-hash", "account": {"address": self.owner},
+        self.tx = {"hash": f"transaction-hash-{len(self.broadcasts)}", "account": {"address": self.owner},
                    "success": True, "aborted": False, "out_msgs": root_messages}
         self.trace = {"transaction": {**self.tx, "out_msgs": []}, "children": children}
+        self.transactions[self.current_message_hash] = self.tx
+        self.traces[self.tx["hash"]] = self.trace
         self.seqno += 1
 
     def get_transaction_by_message_hash(self, message_hash):
-        return self.tx
+        return self.transactions.get(message_hash)
 
     def get_trace(self, transaction_hash):
-        return self.trace if self.trace_visible else None
+        return self.traces.get(transaction_hash) if self.trace_visible else None
 
 
 @unittest.skipUnless(p.PYTONIQ_AVAILABLE, "install requirements.txt for real TON cells")
@@ -164,6 +172,7 @@ class CurrencyTests(unittest.TestCase):
         self.s.wallet = p.Wallet(Offline(self.api), self.api)
         self.s.fragment = CurrencyFragment(self.api.owner, self.api.jetton_wallet, self.api.recipient)
         self.s._provider_lock = threading.RLock()
+        self.s._loop_busy = False
         self.s._low_balance_paused = False
         self.s._bot = self.s.cardinal.telegram.bot
         self.s._admin_chat_id = 42
@@ -295,10 +304,159 @@ class CurrencyTests(unittest.TestCase):
         self.assertEqual(self.s.storage.get("O1")["status"], p.ST_TRANSFERRING)
         self.assertEqual(self.s.cardinal.messages, [])
         self.assertEqual(self.s.cardinal.refunds, [])
+        self.assertTrue(self.s._has_blocking_pending())
         self.s.fragment.confirm_ok = True
         self.s._reconcile_pending()
+        self.assertEqual(len(self.s.fragment.confirmations), 1)
+        retry_at = self.s.storage.get("O1")["payment_attempt"]["fragment_confirm_retry_at"]
+        with mock.patch.object(p.time, "time", return_value=retry_at + 1):
+            self.s._reconcile_pending()
         self.assertEqual(self.s.storage.get("O1")["status"], p.ST_DONE)
         self.assertEqual(len(self.api.broadcasts), 1)
+
+    def test_unknown_confirmation_error_blocks_and_does_not_log_server_secrets(self):
+        self.api.trace_visible = True
+        secret = "cookie_or_hash_should_not_be_logged"
+        self.s.fragment.confirm_stars_payment = mock.Mock(
+            side_effect=p.FragmentError("confirmReq", f"error {secret}"))
+        with mock.patch.object(p.logger, "warning") as warning:
+            self.start(helpers.order())
+        self.assertTrue(self.s._has_blocking_pending())
+        self.assertNotIn("fragment_confirmation_expired", self.s.storage.get("O1")["payment_attempt"])
+        self.assertNotIn(secret, str(warning.call_args_list))
+        self.assertEqual(self.s.cardinal.messages, [])
+        self.assertEqual(self.s.cardinal.refunds, [])
+
+    def expire_first_confirmation(self):
+        self.api.trace_visible = True
+
+        def confirm(method, params, boc, account):
+            self.s.fragment.confirmations.append((method, params, boc, account))
+            if params["id"] == "1":
+                raise p.FragmentError(method, "Session expired")
+
+        self.s.fragment.confirm_stars_payment = confirm
+        self.start(helpers.order())
+
+    def run_cycle(self, service=None):
+        service = service or self.s
+        service._stop = helpers.Ticks(1)
+        service._loop()
+
+    def test_expired_confirmation_does_not_block_next_order_or_retry_old_one(self):
+        self.s.config["refund_on_error"] = True
+        self.expire_first_confirmation()
+        old = self.s.storage.get("O1")
+        self.assertEqual(old["status"], p.ST_NEEDS_REVIEW)
+        self.assertEqual(old["payment_attempt"]["state"], "PENDING")
+        self.assertTrue(old["payment_attempt"]["fragment_confirmation_expired"])
+        self.assertIn("Session expired", self.s.cardinal.notifications[0][1])
+        self.assertEqual(self.s.cardinal.messages, [])
+        self.assertEqual(self.s.cardinal.refunds, [])
+
+        self.s.storage.upsert(helpers.order("O2"))
+        self.run_cycle()
+        self.assertEqual(self.s.storage.get("O1")["status"], p.ST_NEEDS_REVIEW)
+        self.assertEqual(self.s.storage.get("O1")["payment_attempt"]["state"], "PENDING")
+        self.assertEqual(self.s.storage.get("O2")["status"], p.ST_DONE)
+        self.assertEqual(self.api.broadcasts, ["00aabb", "00aabb"])
+        self.assertEqual(self.s.wallet.offline.seqnos, [7, 8])
+        self.assertEqual(self.s.fragment.currencies, ["USDT", "USDT"])
+        self.assertEqual([message[0] for message in self.s.cardinal.messages], ["O2"])
+        self.assertEqual(self.s.cardinal.refunds, [])
+        self.assertEqual(len(self.s.fragment.confirmations), 2)
+
+    def test_expired_confirmation_restores_seqno_after_restart_with_stale_tonapi(self):
+        self.expire_first_confirmation()
+        restarted = copy.copy(self.s)
+        restarted.storage = p.Storage(self.s.storage.path)
+        restarted.wallet = p.Wallet(Offline(self.api), self.api)
+        restarted.wallet._min_seqno = restarted.storage.get_confirmed_seqno(restarted.wallet.address)
+        self.api.cached_seqno = 7
+        restarted.storage.upsert(helpers.order("O2"))
+        self.run_cycle(restarted)
+        self.assertEqual(restarted.wallet.offline.seqnos, [8])
+        self.assertEqual(restarted.storage.get("O1")["payment_attempt"]["state"], "PENDING")
+        self.assertEqual(restarted.storage.get("O2")["status"], p.ST_DONE)
+        self.assertEqual(len(self.api.broadcasts), 2)
+
+    def test_expired_old_order_can_confirm_later_without_another_purchase(self):
+        self.expire_first_confirmation()
+        self.s.storage.upsert(helpers.order("O2"))
+        self.run_cycle()
+        retry_at = self.s.storage.get("O1")["payment_attempt"]["fragment_confirm_retry_at"]
+        self.s.fragment.confirm_stars_payment = lambda *args: None
+        with mock.patch.object(p.time, "time", return_value=retry_at + 1):
+            self.s._reconcile_pending()
+        self.assertEqual(self.s.storage.get("O1")["status"], p.ST_DONE)
+        self.assertEqual([message[0] for message in self.s.cardinal.messages], ["O2", "O1"])
+        self.assertEqual(len(self.api.broadcasts), 2)
+        self.assertEqual(len(self.s.fragment.currencies), 2)
+
+    def test_direct_batch_cannot_rebuy_expired_order_even_from_stale_copy(self):
+        stale_copy = helpers.order()
+        self.expire_first_confirmation()
+        next_order = helpers.order("O2")
+        self.s.storage.upsert(next_order)
+        self.s._transfer_batch([stale_copy, next_order])
+        self.assertEqual(self.s.storage.get("O1")["payment_attempt"]["state"], "PENDING")
+        self.assertEqual(self.s.storage.get("O2")["status"], p.ST_DONE)
+        self.assertEqual(len(self.api.broadcasts), 2)
+        self.assertEqual(len(self.s.fragment.currencies), 2)
+
+    def test_expired_confirmation_with_missing_evidence_still_blocks(self):
+        self.expire_first_confirmation()
+        valid = self.s.storage.get("O1")
+        mutations = [
+            lambda a, e: a.pop("in_msg_hash"),
+            lambda a, e: a.pop("transaction_hash"),
+            lambda a, e: a.update(wallet_address="different-wallet"),
+            lambda a, e: a.update(wallet_executed=False),
+            lambda a, e: a.update(seqno=None),
+            lambda a, e: a.update(seqno=True),
+            lambda a, e: a.update(seqno=-1),
+            lambda a, e: a.pop("fragment_confirmation_expired"),
+            lambda a, e: e.update(currency="TON"),
+            lambda a, e: e.update(confirm_params=None),
+        ]
+        for mutate in mutations:
+            with self.subTest(mutation=mutate):
+                broken = copy.deepcopy(valid)
+                mutate(broken["payment_attempt"], broken["expected_message"])
+                self.s.storage.upsert(broken)
+                self.assertTrue(self.s._has_blocking_pending())
+        self.s.storage.upsert(valid)
+        self.assertFalse(self.s._has_blocking_pending())
+        self.s.wallet._min_seqno = valid["payment_attempt"]["seqno"]
+        self.assertTrue(self.s._has_blocking_pending())
+
+    def test_other_unresolved_payment_blocks_even_if_expired_one_is_safe(self):
+        self.expire_first_confirmation()
+        other = helpers.order("O2")
+        other["status"] = p.ST_TRANSFERRING
+        self.s.storage.upsert(other)
+        self.assertTrue(self.s._has_blocking_pending())
+        self.s.storage.upsert(helpers.order("O3"))
+        self.run_cycle()
+        self.assertEqual(len(self.api.broadcasts), 1)
+        self.assertEqual(self.s.storage.get("O3")["retries_left"], 3)
+
+    def test_fragment_confirmation_backoff_and_reconnect(self):
+        self.expire_first_confirmation()
+        first = self.s.storage.get("O1")["payment_attempt"]
+        self.s._reconcile_pending()
+        self.assertEqual(len(self.s.fragment.confirmations), 1)
+        with mock.patch.object(p.time, "time", return_value=first["fragment_confirm_retry_at"] + 1):
+            self.s._reconcile_pending()
+        second = self.s.storage.get("O1")["payment_attempt"]
+        self.assertEqual(second["fragment_confirm_retries"], 2)
+        self.assertEqual(second["fragment_confirm_retry_at"] - first["fragment_confirm_retry_at"], 61)
+        self.assertEqual(len(self.s.cardinal.notifications), 1)
+
+        self.s.reload_providers()
+        reloaded = self.s.storage.get("O1")["payment_attempt"]
+        self.assertNotIn("fragment_confirm_retry_at", reloaded)
+        self.assertTrue(reloaded["fragment_confirmation_expired"])
 
     def test_failed_jetton_execution_requires_review_without_refund(self):
         self.api.trace_visible = True

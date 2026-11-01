@@ -63,7 +63,7 @@ except Exception as e:  # noqa: BLE001
 # ============================== МЕТА-ДАННЫЕ ПЛАГИНА ==============================
 
 NAME = "AutoStars"
-VERSION = "0.4.3"
+VERSION = "0.4.4"
 DESCRIPTION = (
     "Автовыдача Telegram Stars: покупка звёзд через Fragment и оплата с "
     "TON-кошелька W5. Требует: pip install pytoniq."
@@ -91,6 +91,8 @@ AD_TEXT = "Stars sent automatically by AutoStars plugin for FunPayCardinal."
 PAYMENT_REVIEW_GRACE_SEC = 120
 MIN_PAYMENT_TTL_SEC = 15
 PAYMENT_REBROADCAST_SEC = 30
+FRAGMENT_CONFIRM_RETRY_BASE_SEC = 30
+FRAGMENT_CONFIRM_RETRY_MAX_SEC = 900
 
 DEFAULT_CONFIG = {
     "fragment_cookies": "",
@@ -702,8 +704,10 @@ class Storage:
         with self._lock:
             attempts = [o.get("payment_attempt", {}) for o in self.orders.values()]
             return max((
-                int(a["seqno"]) + 1 for a in attempts
-                if a.get("wallet_address") == wallet_address and a.get("wallet_executed")
+                a["seqno"] + 1 for a in attempts
+                if isinstance(a, dict) and a.get("wallet_address") == wallet_address
+                and a.get("wallet_executed") is True
+                and type(a.get("seqno")) is int and a["seqno"] >= 0
             ), default=0)
 
     def get_attempt_orders(self, wallet_address: str, message_hash: str) -> list[dict]:
@@ -1296,6 +1300,34 @@ class AutoStarsService:
 
     # ---------- цикл перевода ----------
 
+    def _has_blocking_pending(self) -> bool:
+        """Не выпускаем следующий платёж, пока результат предыдущего не ясен.
+
+        Исключение — проверенный перевод USDT, для которого Fragment сообщил об
+        истечении подтверждения. Сам заказ по-прежнему нельзя купить или вернуть.
+        """
+        for order in self.storage.get_pending_orders():
+            attempt = order.get("payment_attempt")
+            expected = order.get("expected_message")
+            if not isinstance(attempt, dict) or not isinstance(expected, dict) or not self.wallet:
+                return True
+            seqno = attempt.get("seqno")
+            if not (
+                attempt.get("state") == "PENDING"
+                and attempt.get("wallet_executed") is True
+                and attempt.get("fragment_confirmation_expired") is True
+                and expected.get("currency") == "USDT"
+                and expected.get("confirm_method") == "confirmReq"
+                and isinstance(expected.get("confirm_params"), dict)
+                and isinstance(attempt.get("in_msg_hash"), str) and attempt["in_msg_hash"]
+                and isinstance(attempt.get("transaction_hash"), str) and attempt["transaction_hash"]
+                and attempt.get("wallet_address") == self.wallet.address
+                and type(seqno) is int and seqno >= 0
+                and self.wallet._min_seqno > seqno
+            ):
+                return True
+        return False
+
     def _loop(self) -> None:
         while not self._stop.is_set():
             interval = max(2, int(self.config.get("loop_interval_sec", 5)))
@@ -1309,7 +1341,7 @@ class AutoStarsService:
                 with self._provider_lock:
                     # Сначала восстанавливаем старые попытки, даже при смене ключей/низком балансе.
                     self._reconcile_pending()
-                    if self.storage.get_pending_orders() or not self.fragment or not self.wallet:
+                    if not self.fragment or not self.wallet or self._has_blocking_pending():
                         continue
                     if float(self.config.get("low_balance_threshold", 0)) > 0 or self._low_balance_paused:
                         try:
@@ -1335,7 +1367,21 @@ class AutoStarsService:
                 self._loop_busy = False
 
     def _transfer_batch(self, orders: list[dict]) -> None:
-        if self.storage.get_pending_orders():
+        if self._has_blocking_pending():
+            return
+        # Защита и для прямых вызовов со старыми копиями заказов из памяти.
+        eligible = []
+        for order in orders:
+            saved = self.storage.get(order["order_id"])
+            if any(
+                (o.get("payment_attempt") or {}).get("state") in ("PENDING", "CONFIRMED")
+                for o in (order, saved) if o is not None
+            ):
+                logger.warning(f"{LOGGER_PREFIX} Повторная покупка заказа {order['order_id']} заблокирована.")
+                continue
+            eligible.append(order)
+        orders = eligible
+        if not orders:
             return
         currency = payment_currency(self.config)
         jetton_balance, jetton_wallet = None, None
@@ -1482,6 +1528,14 @@ class AutoStarsService:
             pending = [o for o in orders if o.get("payment_attempt", {}).get("state") == "PENDING"]
             if not pending:
                 continue
+            # После неудачного confirmReq не опрашиваем Fragment и TonAPI каждые 5 секунд.
+            if all(
+                o["payment_attempt"].get("wallet_executed") is True
+                and isinstance(o["payment_attempt"].get("fragment_confirm_retry_at"), (int, float))
+                and o["payment_attempt"]["fragment_confirm_retry_at"] > time.time()
+                for o in pending
+            ):
+                continue
             try:
                 tx = self.tonapi.get_transaction_by_message_hash(message_hash)
             except Exception as e:  # noqa: BLE001
@@ -1490,7 +1544,7 @@ class AutoStarsService:
             if tx is None:
                 # Повторяем только те же подписанные байты и только в пределах срока.
                 # Это также восстанавливает остановку между записью журнала и send_boc.
-                if self.wallet and self.wallet.address == wallet_address and (
+                if attempt.get("wallet_executed") is not True and self.wallet and self.wallet.address == wallet_address and (
                     time.time() < attempt["valid_until"] - MIN_PAYMENT_TTL_SEC
                     and time.time() - attempt.get("last_broadcast_at", 0) >= PAYMENT_REBROADCAST_SEC
                 ):
@@ -1576,6 +1630,11 @@ class AutoStarsService:
                     uncertain.append(order)
                     continue
                 if expected.get("confirm_method"):
+                    saved_attempt = order["payment_attempt"]
+                    retry_at = saved_attempt.get("fragment_confirm_retry_at", 0)
+                    if isinstance(retry_at, (int, float)) and retry_at > time.time():
+                        awaiting.append(order)
+                        continue
                     try:
                         if not self.fragment:
                             raise ValueError("Fragment не подключён")
@@ -1583,7 +1642,20 @@ class AutoStarsService:
                             expected["confirm_method"], expected["confirm_params"],
                             order["payment_attempt"]["boc"], order["payment_attempt"]["tonconnect_account"])
                     except Exception as e:  # noqa: BLE001
-                        logger.warning(f"{LOGGER_PREFIX} Fragment ещё не подтвердил заказ {order['order_id']}: {e}")
+                        expired = (isinstance(e, FragmentError) and e.method == "confirmReq"
+                                   and e.error_text.strip().casefold() == "session expired")
+                        if expired:
+                            saved_attempt["fragment_confirmation_expired"] = True
+                        retries = saved_attempt.get("fragment_confirm_retries", 0)
+                        retries = retries if type(retries) is int and retries >= 0 else 0
+                        retries = min(retries + 1, 32)
+                        delay = min(FRAGMENT_CONFIRM_RETRY_BASE_SEC * 2 ** min(retries - 1, 5),
+                                    FRAGMENT_CONFIRM_RETRY_MAX_SEC)
+                        saved_attempt["fragment_confirm_retries"] = retries
+                        saved_attempt["fragment_confirm_retry_at"] = int(time.time()) + delay
+                        reason = "Session expired" if expired else type(e).__name__
+                        logger.warning(f"{LOGGER_PREFIX} Fragment ещё не подтвердил заказ {order['order_id']}: "
+                                       f"{reason}; повтор через {delay} сек.")
                         awaiting.append(order)
                         continue
             if message:
@@ -1605,8 +1677,15 @@ class AutoStarsService:
             self._on_success(order)
         if uncertain:
             self._mark_for_review(uncertain, "Исходящий платёж или цепочка USDT не подтверждены.")
-        if awaiting and time.time() > attempt["valid_until"] + PAYMENT_REVIEW_GRACE_SEC:
-            self._mark_for_review(awaiting, "Перевод USDT или подтверждение Fragment пока не завершены.")
+        expired = [o for o in awaiting if o["payment_attempt"].get("fragment_confirmation_expired") is True]
+        if expired:
+            self._mark_for_review(
+                expired, "Fragment отклонил подтверждение: Session expired. Проверьте выдачу Stars и "
+                         "авторизацию Fragment; прежний заказ не оплачивайте повторно."
+            )
+        still_waiting = [o for o in awaiting if o not in expired]
+        if still_waiting and time.time() > attempt["valid_until"] + PAYMENT_REVIEW_GRACE_SEC:
+            self._mark_for_review(still_waiting, "Перевод USDT или подтверждение Fragment пока не завершены.")
 
     def _prepare_transfer(self, order: dict, currency: str = "TON", jetton_wallet: str | None = None) -> dict | None:
         stage = "Создание заявки в Fragment"
@@ -1796,6 +1875,17 @@ class AutoStarsService:
         """Пересоздаёт Fragment/кошелёк/tonapi по текущему конфигу. Возвращает статус-текст."""
         lines = []
         self.tonapi.token = self.config.get("ton_api_token") or None
+
+        # После обновления cookies/hash разрешаем сразу перепроверить старые заявки.
+        retry_now = []
+        for order in self.storage.get_pending_orders():
+            attempt = order.get("payment_attempt")
+            if isinstance(attempt, dict) and "fragment_confirm_retry_at" in attempt:
+                attempt.pop("fragment_confirm_retry_at", None)
+                attempt.pop("fragment_confirm_retries", None)
+                retry_now.append(order)
+        if retry_now:
+            self.storage.upsert(*retry_now)
 
         if self.config.get("fragment_cookies") and self.config.get("fragment_hash"):
             self.fragment = FragmentAPI(self.config["fragment_cookies"], self.config["fragment_hash"])
