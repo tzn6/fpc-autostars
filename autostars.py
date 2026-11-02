@@ -6,7 +6,7 @@ AutoStars — плагин автовыдачи Telegram Stars для FunPayCard
   2. определяет кол-во звёзд и Telegram-юзернейм (из описания заказа или из чата);
   3. проверяет юзернейм через Fragment (searchStarsRecipient);
   4. покупает звёзды на Fragment и получает данные TON-транзакции;
-  5. подписывает и отправляет оплату TON или USDT с вашего кошелька (W5 -> tonapi.io);
+  5. подписывает и отправляет перевод TON с вашего кошелька (W5 -> tonapi.io);
   6. дожидается подтверждения, пишет покупателю и (опционально) делает возврат при ошибке.
 
 Установка:
@@ -17,7 +17,7 @@ AutoStars — плагин автовыдачи Telegram Stars для FunPayCard
      Заполните в нём fragment_cookies, fragment_hash, ton_mnemonic
      (сид-фраза кошелька W5) и, по желанию, ton_api_token.
 
-ВНИМАНИЕ: плагин работает с реальными деньгами (TON и USDT). Используйте отдельный
+ВНИМАНИЕ: плагин работает с реальными деньгами (TON). Используйте отдельный
 кошелёк под автовыдачу и держите на нём только рабочий баланс.
 
 Покупатель может (пере)задать юзернейм в чате командой:  /stars username
@@ -30,12 +30,9 @@ import re
 import json
 import time
 import base64
-import binascii
 import copy
 import html
 import logging
-import math
-import contextlib
 import tempfile
 import threading
 from typing import TYPE_CHECKING, Any
@@ -63,7 +60,7 @@ except Exception as e:  # noqa: BLE001
 # ============================== МЕТА-ДАННЫЕ ПЛАГИНА ==============================
 
 NAME = "AutoStars"
-VERSION = "0.4.3"
+VERSION = "0.3.1"
 DESCRIPTION = (
     "Автовыдача Telegram Stars: покупка звёзд через Fragment и оплата с "
     "TON-кошелька W5. Требует: pip install pytoniq."
@@ -84,9 +81,6 @@ ORDERS_PATH = os.path.join("storage", "plugins", "autostars_orders.json")
 WALLET_V5R1_ID = 2147483409
 TON_NETWORK_GLOBAL_ID = -239
 ONE_TON = 1_000_000_000
-ONE_USDT = 1_000_000
-USDT_MASTER = "EQCxE6mUtQJKFnGfaROTKOt1lZbDiiX1kCixRv7Nw2Id_sDs"
-PAYMENT_METHODS = {"TON": "ton", "USDT": "usdt_ton"}
 AD_TEXT = "Stars sent automatically by AutoStars plugin for FunPayCardinal."
 PAYMENT_REVIEW_GRACE_SEC = 120
 MIN_PAYMENT_TTL_SEC = 15
@@ -97,7 +91,6 @@ DEFAULT_CONFIG = {
     "fragment_hash": "",
     "ton_mnemonic": "",
     "ton_api_token": "",
-    "payment_currency": "TON",
     "show_sender": False,
     "show_ad": False,
     "refund_on_error": False,
@@ -142,7 +135,6 @@ ERR_FRAGMENT_NOT_PROVIDED = "FRAGMENT_API_NOT_PROVIDED"
 ERR_UNABLE_TO_FETCH_LINK = "UNABLE_TO_FETCH_STARS_LINK"
 ERR_GET_BALANCE = "GET_BALANCE_ERROR"
 ERR_NOT_ENOUGH_TON = "NOT_ENOUGH_TON"
-ERR_NOT_ENOUGH_USDT = "NOT_ENOUGH_USDT"
 ERR_TRANSFER = "TRANSFER_ERROR"
 ERR_TIMEOUT = "TRANSACTION_TIMEOUT_ERROR"
 ERR_TRANSACTION_FAILED = "TRANSACTION_FAILED"
@@ -158,7 +150,6 @@ ERROR_DESC = {
     ERR_UNABLE_TO_FETCH_LINK: "Не удалось получить данные для перевода (Fragment)",
     ERR_GET_BALANCE: "Не удалось получить баланс кошелька",
     ERR_NOT_ENOUGH_TON: "Недостаточно TON",
-    ERR_NOT_ENOUGH_USDT: "Недостаточно USDT в сети TON",
     ERR_TRANSFER: "Не удалось отправить транзакцию",
     ERR_TIMEOUT: "Таймаут ожидания подтверждения транзакции",
     ERR_TRANSACTION_FAILED: "TON-транзакция завершилась без отправки платежей",
@@ -193,14 +184,6 @@ class FragmentError(Exception):
         self.error_text = text
 
 
-def tonconnect_device() -> dict:
-    return {
-        "platform": "linux", "appName": "AutoStars", "appVersion": VERSION,
-        "maxProtocolVersion": 2,
-        "features": ["SendTransaction", {"name": "SendTransaction", "maxMessages": 65}],
-    }
-
-
 class FragmentAPI:
     BASE_URL = "https://fragment.com/api"
     HEADERS = {
@@ -228,13 +211,7 @@ class FragmentAPI:
             data = resp.json()
         except Exception as e:  # noqa: BLE001
             raise FragmentError(payload.get("method", "?"), "invalid JSON") from e
-        if not isinstance(data, dict):
-            raise FragmentError(payload.get("method", "?"), "invalid JSON object")
-        if data.get("need_verify"):
-            raise FragmentError(payload.get("method", "?"), "need_verify")
-        if data.get("need_ton"):
-            raise FragmentError(payload.get("method", "?"), "need_ton")
-        if data.get("error"):
+        if data and data.get("error"):
             raise FragmentError(payload.get("method", "?"), str(data["error"]))
         return data
 
@@ -249,99 +226,30 @@ class FragmentAPI:
             raise FragmentError("searchStarsRecipient", "recipient not found")
         return found
 
-    def init_buy_stars_request(self, recipient: str, quantity: int, currency: str = "TON") -> dict[str, Any]:
+    def init_buy_stars_request(self, recipient: str, quantity: int) -> dict[str, Any]:
         if quantity < 50 or quantity > 1_000_000:
             raise FragmentError("initBuyStarsRequest", f"invalid quantity {quantity}")
-        if currency not in PAYMENT_METHODS:
-            raise FragmentError("initBuyStarsRequest", f"unsupported currency {currency}")
         data = self._post({
             "method": "initBuyStarsRequest",
             "recipient": recipient,
             "quantity": str(quantity),
-            "payment_method": PAYMENT_METHODS[currency],
+            "payment_method": "ton",
         })
         if not data.get("req_id"):
             raise FragmentError("initBuyStarsRequest", "no req_id")
         return data
 
-    def get_buy_stars_link(self, request_id: str, show_sender: bool = False,
-                           account: dict | None = None) -> dict[str, Any]:
-        payload = {
+    def get_buy_stars_link(self, request_id: str, show_sender: bool = False) -> dict[str, Any]:
+        data = self._post({
             "method": "getBuyStarsLink",
             "id": request_id,
             "show_sender": "1" if show_sender else "0",
             "transaction": "1",
-        }
-        if account is not None:
-            payload.update(account=json.dumps(account), device=json.dumps(tonconnect_device()))
-        data = self._post(payload)
+        })
         tr = data.get("transaction")
         if not tr or not isinstance(tr.get("messages"), list) or not tr["messages"]:
             raise FragmentError("getBuyStarsLink", "no transaction in response")
         return data
-
-    def confirm_stars_payment(self, method: str, params: dict, boc: str, account: dict) -> None:
-        if method != "confirmReq" or not isinstance(params, dict):
-            raise FragmentError("confirmReq", "unsupported confirmation data")
-        payload = dict(params)
-        payload.update(method=method, account=json.dumps(account), device=json.dumps(tonconnect_device()),
-                       boc=base64.b64encode(bytes.fromhex(boc)).decode("ascii"))
-        if self._post(payload).get("ok") is not True:
-            raise FragmentError(method, "confirmation not accepted")
-
-
-def payment_error_detail(stage: str, error: Exception) -> str:
-    """Safe, bounded diagnostics: never expose server text, URLs or credentials."""
-    if isinstance(error, FragmentError):
-        reason = error.error_text
-        known = {
-            "need_verify": "Fragment требует пройти проверку аккаунта или кошелька.",
-            "need_ton": "Fragment просит подключить TON-кошелёк к аккаунту.",
-            "invalid JSON": "Fragment вернул некорректный ответ JSON.",
-            "invalid JSON object": "Fragment вернул ответ неожиданного формата.",
-            "no req_id": "Fragment не вернул идентификатор заявки.",
-            "no transaction in response": "Fragment не вернул транзакцию для оплаты.",
-            "expected exactly one payment message": "Fragment вернул неожиданное количество платёжных сообщений.",
-            "payment amount must be positive": "Fragment вернул некорректную сумму платежа.",
-        }
-        if reason in known:
-            description = known[reason]
-        elif re.fullmatch(r"HTTP [1-5][0-9]{2}", reason):
-            description = f"Fragment вернул {reason}."
-        elif any(word in reason.casefold() for word in ("access denied", "unauthorized", "unauthorised")):
-            description = "Fragment отклонил авторизацию; проверьте cookies и hash."
-        else:
-            description = "Fragment отклонил запрос; точная причина в журнале FPC."
-    else:
-        exceptions = getattr(requests, "exceptions", None)
-        known_values = {
-            "Отправитель Fragment не совпадает с кошельком.": "Отправитель Fragment не совпадает с кошельком.",
-            "Fragment вернул неподдерживаемый stateInit для платежа USDT.":
-                "Fragment вернул неподдерживаемый stateInit для платежа USDT.",
-            "Адрес USDT-кошелька не совпадает с кошельком владельца.":
-                "Адрес USDT-кошелька не совпадает с кошельком владельца.",
-            "В платеже USDT отсутствует комиссия для уведомления получателя.":
-                "В платеже USDT отсутствует комиссия для уведомления получателя.",
-            "Fragment вернул неизвестные параметры подтверждения.":
-                "Fragment вернул неизвестные параметры подтверждения.",
-            "Некорректная кодировка Base64 платёжных данных.":
-                "Fragment вернул платёжные данные с неверной кодировкой Base64.",
-            "unexpected jetton opcode": "В ответе Fragment неверная команда перевода USDT.",
-            "invalid jetton amount or address": "В ответе Fragment неверные сумма или адрес перевода USDT.",
-        }
-        if exceptions is not None and isinstance(error, exceptions.Timeout):
-            description = "Истекло время ожидания ответа Fragment."
-        elif exceptions is not None and isinstance(error, exceptions.ConnectionError):
-            description = "Не удалось подключиться к Fragment."
-        elif isinstance(error, ValueError) and str(error) in known_values:
-            description = known_values[str(error)]
-        elif isinstance(error, KeyError) and error.args and error.args[0] in {
-            "transaction", "messages", "amount", "address", "validUntil", "payload", "req_id"
-        }:
-            description = f"В ответе Fragment отсутствует поле {error.args[0]}."
-        else:
-            description = "Не удалось обработать данные платежа; подробности в журнале FPC."
-    return f"{stage}: {description}"
 
 
 # ============================== tonapi.io ==============================
@@ -396,24 +304,6 @@ class TonAPI:
     def get_wallet(self, address: str) -> dict:
         return self._request("GET", f"/v2/wallet/{address}")
 
-    def get_usdt_balance(self, address: str) -> tuple[int, str | None]:
-        """USDT balance in micro-units and the owner's official jetton wallet."""
-        data = self._request("GET", f"/v2/accounts/{address}/jettons/{USDT_MASTER}")
-        if data is None:  # The owner has no indexed USDT wallet yet.
-            return 0, None
-        try:
-            if Address(data["jetton"]["address"]).to_str(is_user_friendly=False) != Address(
-                USDT_MASTER
-            ).to_str(is_user_friendly=False) or int(data["jetton"]["decimals"]) != 6:
-                raise ValueError("unexpected USDT master or decimals")
-            balance = int(data["balance"])
-            wallet = Address(data["wallet_address"]["address"]).to_str(is_user_friendly=False)
-            if balance < 0:
-                raise ValueError("negative USDT balance")
-            return balance, wallet
-        except (KeyError, TypeError, ValueError) as e:
-            raise TonAPIError(f"invalid USDT balance response: {e}") from e
-
     def get_seqno(self, address: str) -> int:
         data = self._request("GET", f"/v2/wallet/{address}/seqno")
         return int((data or {}).get("seqno", 0))
@@ -425,12 +315,6 @@ class TonAPI:
         data = self._request("GET", f"/v2/blockchain/messages/{message_hash}/transaction")
         if data is not None and (not isinstance(data, dict) or not data.get("hash")):
             raise TonAPIError("invalid transaction response")
-        return data
-
-    def get_trace(self, transaction_hash: str) -> dict | None:
-        data = self._request("GET", f"/v2/traces/{transaction_hash}")
-        if data is not None and not isinstance(data, dict):
-            raise TonAPIError("invalid trace response")
         return data
 
     def wait_for_transfer(self, message_hash: str, valid_until: int) -> dict:
@@ -449,34 +333,19 @@ def _pad_b64(b64: str) -> str:
     return b64 + "=" * (4 - pad) if pad else b64
 
 
-def _decode_fragment_payload(payload_b64: str) -> bytes:
-    """Decode standard or URL-safe Base64 without silently discarding bytes."""
-    if not isinstance(payload_b64, str) or not payload_b64.strip():
-        raise ValueError("Некорректная кодировка Base64 платёжных данных.")
-    normalized = payload_b64.strip().replace("-", "+").replace("_", "/")
-    try:
-        decoded = base64.b64decode(_pad_b64(normalized), validate=True)
-        if not decoded:
-            raise ValueError("empty payload")
-        return decoded
-    except (binascii.Error, ValueError) as e:
-        raise ValueError("Некорректная кодировка Base64 платёжных данных.") from e
-
-
 def extract_ref(payload_b64: str) -> str | None:
     """Достаёт реф-код 'Ref#...' из payload Fragment (для альтернативного комментария)."""
     if not payload_b64:
         return None
-    payload = _decode_fragment_payload(payload_b64)
     try:
-        cell = Cell.one_from_boc(payload)
+        cell = Cell.one_from_boc(base64.b64decode(_pad_b64(payload_b64)))
         text = cell.begin_parse().load_snake_string()
         m = re.search(r"Ref#.+", text)
         if m:
             return re.sub(r"[^A-Za-z0-9:#]", "", m.group())
     except Exception:  # noqa: BLE001
         pass
-    raw = payload.decode("latin1", "ignore")
+    raw = base64.b64decode(_pad_b64(payload_b64)).decode("latin1", "ignore")
     m = re.search(r"Ref#[A-Za-z0-9:#]+", raw)
     return re.sub(r"[^A-Za-z0-9:#]", "", m.group()) if m else None
 
@@ -493,19 +362,10 @@ class OfflineWallet:
             self.public_key, wallet_id=WALLET_V5R1_ID, network_global_id=TON_NETWORK_GLOBAL_ID
         )
         state_init = StateInit(code=WALLET_V5_R1_CODE, data=data_cell)
-        self.state_init = state_init
         self.address = Address((0, state_init.serialize().hash))
 
     def address_str(self, bounceable: bool = True) -> str:
         return self.address.to_str(is_user_friendly=True, is_bounceable=bounceable)
-
-    def tonconnect_account(self) -> dict:
-        return {
-            "address": self.address.to_str(is_user_friendly=False),
-            "chain": str(TON_NETWORK_GLOBAL_ID),
-            "walletStateInit": base64.b64encode(self.state_init.serialize().to_boc()).decode("ascii"),
-            "publicKey": self.public_key.hex(),
-        }
 
     def build_external_transfer(self, seqno: int, transfers: list[dict]) -> tuple[str, str]:
         """transfers: [{address, amount, body(Cell|str), valid_until}] -> (boc_hex, msg_hash_hex)."""
@@ -566,7 +426,7 @@ class Wallet:
                 f"используем локальный {seqno}."
             )
         boc, in_hash = self.offline.build_external_transfer(seqno, transfers)
-        attempt = {
+        return {
             "wallet_address": self.address,
             "seqno": seqno,
             "boc": boc,
@@ -575,9 +435,6 @@ class Wallet:
             "created_at": int(time.time()),
             "state": "PENDING",
         }
-        if any(t.get("confirm_method") for t in transfers):
-            attempt["tonconnect_account"] = self.offline.tonconnect_account()
-        return attempt
 
     def broadcast_transfer(self, attempt: dict) -> None:
         self.tonapi.send_boc(attempt["boc"])
@@ -747,178 +604,6 @@ def _outgoing_key(message: dict) -> tuple[str, int, str]:
     return Address(address).to_str(is_user_friendly=False), int(message["value"]), body_hash
 
 
-def payment_currency(config: dict) -> str:
-    currency = config.get("payment_currency", "TON")
-    if currency not in PAYMENT_METHODS:
-        raise ValueError(f"Неподдерживаемая валюта оплаты: {currency}")
-    return currency
-
-
-def currency_unit(currency: str) -> int:
-    if currency not in PAYMENT_METHODS:
-        raise ValueError(f"Неподдерживаемая валюта оплаты: {currency}")
-    return ONE_TON if currency == "TON" else ONE_USDT
-
-
-def switch_payment_currency(config: dict, currency: str) -> None:
-    """Keep the low-balance thresholds separate when changing the payment asset."""
-    old = payment_currency(config)
-    currency_unit(currency)
-    thresholds = config.setdefault("low_balance_thresholds", {})
-    thresholds[old] = config.get("low_balance_threshold", 0.0)
-    config["payment_currency"] = currency
-    config["low_balance_threshold"] = thresholds.get(currency, 0.0)
-
-
-def _jetton_fields(body, opcode: int) -> tuple[int, int, str, Any]:
-    """Parse the shared prefix of a TEP-74 transfer/notification body."""
-    parsed = body.begin_parse()
-    if parsed.load_uint(32) != opcode:
-        raise ValueError("unexpected jetton opcode")
-    query_id = parsed.load_uint(64)
-    amount = parsed.load_coins()
-    address = parsed.load_address()
-    if amount <= 0 or address is None:
-        raise ValueError("invalid jetton amount or address")
-    return query_id, amount, address.to_str(is_user_friendly=False), parsed
-
-
-def _trace_address(value: Any) -> str:
-    if isinstance(value, dict):
-        value = value["address"]
-    if not isinstance(value, str) or not value:
-        raise ValueError("invalid trace address")
-    return Address(value).to_str(is_user_friendly=False)
-
-
-def _trace_children(node: dict) -> list[tuple[dict, dict]]:
-    """TonAPI moves consumed out_msgs into the child transaction's in_msg."""
-    try:
-        if node.get("emulated") is True:
-            return []
-        parent = _trace_address(node["transaction"]["account"])
-        children = node.get("children", [])
-        if not isinstance(children, list):
-            return []
-    except Exception:  # noqa: BLE001 - incomplete trace
-        return []
-    links = []
-    for child in children:
-        try:
-            transaction = child["transaction"]
-            incoming = transaction["in_msg"]
-            if (incoming.get("msg_type") != "int_msg" or incoming.get("bounced") is not False
-                    or not isinstance(incoming.get("hash"), str) or not incoming["hash"]
-                    or _trace_address(incoming["source"]) != parent
-                    or _trace_address(incoming["destination"]) != _trace_address(transaction["account"])):
-                continue
-            links.append((incoming, child))
-        except Exception:  # noqa: BLE001 - malformed child cannot confirm a payment
-            continue
-    return links
-
-
-def _trace_child(node: dict, message: dict) -> dict | None:
-    """Find the transaction consuming this exact internal message."""
-    try:
-        msg_hash = message["hash"]
-        destination = _trace_address(message["destination"])
-        if not isinstance(msg_hash, str) or not msg_hash:
-            return None
-        matches = [child for incoming, child in _trace_children(node)
-                   if incoming["hash"] == msg_hash and _trace_address(incoming["destination"]) == destination]
-        return matches[0] if len(matches) == 1 else None
-    except Exception:  # noqa: BLE001
-        return None
-
-
-def _trace_success(node: dict) -> bool | None:
-    if node.get("emulated") is True:
-        return None
-    tx = node.get("transaction") or {}
-    if not isinstance(tx.get("success"), bool) or not isinstance(tx.get("aborted"), bool):
-        return None
-    if not tx["success"] or tx["aborted"] or (tx.get("compute_phase") or {}).get("skipped") is True \
-            or (tx.get("compute_phase") or {}).get("success") is False \
-            or (tx.get("action_phase") or {}).get("success") is False:
-        return False
-    return True
-
-
-def _notification_received(node: dict) -> bool | None:
-    """A non-bounceable message can be credited even when compute is skipped."""
-    status = _trace_success(node)
-    if status is not False:
-        return status
-    try:
-        tx = node["transaction"]
-        message = tx["in_msg"]
-        compute = tx["compute_phase"]
-        credit = tx["credit_phase"]["credit"]
-        value = message["value"]
-        # A one-nanoton jetton notification commonly has no gas for contract execution.
-        # Only accept a non-bounced, fully credited notification with no bounce/actions.
-        if (message.get("bounce") is False and message.get("bounced") is False
-                and tx.get("success") is False and tx.get("aborted") is True
-                and tx.get("orig_status") in ("active", "uninit", "nonexist")
-                and tx.get("end_status") in ("active", "uninit", "nonexist")
-                and compute.get("skipped") is True
-                and compute.get("skip_reason") in ("cskip_no_gas", "cskip_no_state")
-                and isinstance(value, int) and not isinstance(value, bool) and value > 0
-                and isinstance(credit, int) and not isinstance(credit, bool) and credit == value
-                and tx.get("bounce_phase") is None and tx.get("action_phase") is None
-                and tx.get("out_msgs") == [] and not node.get("children")):
-            return True
-    except Exception:  # noqa: BLE001 - incomplete notification cannot confirm a payment
-        pass
-    return False
-
-
-def _verify_usdt_trace(trace: dict | None, root_tx: dict, message: dict, expected: dict,
-                       wallet_address: str) -> bool | None:
-    """True: token notification delivered; False: failure; None: incomplete trace."""
-    if not trace or trace.get("emulated") is True or (trace.get("transaction") or {}).get("hash") != root_tx.get("hash"):
-        return None
-    wallet = _trace_child(trace, message)
-    if not wallet:
-        return None
-    status = _trace_success(wallet)
-    if status is not True:
-        return status
-
-    # Follow consumed in_msg records: completed messages are absent from out_msgs in a trace.
-    receivers = []
-    for internal, receiver in _trace_children(wallet):
-        try:
-            body = Cell.one_from_boc(bytes.fromhex(internal["raw_body"]))
-            query, amount, sender, _ = _jetton_fields(body, 0x178D4519)
-            if (query, amount, sender) != (expected["jetton_query_id"], expected["jetton_amount"],
-                                            Address(wallet_address).to_str(is_user_friendly=False)):
-                continue
-        except Exception:  # noqa: BLE001
-            continue
-        receivers.append(receiver)
-    if len(receivers) != 1:
-        return None
-    receiver = receivers[0]
-    status = _trace_success(receiver)
-    if status is not True:
-        return status
-    notifications = []
-    for notification, delivered in _trace_children(receiver):
-        try:
-            body = Cell.one_from_boc(bytes.fromhex(notification["raw_body"]))
-            query, amount, sender, _ = _jetton_fields(body, 0x7362D09C)
-            if (_trace_address(notification["destination"]) != expected["jetton_recipient"]
-                    or (query, amount, sender) != (expected["jetton_query_id"], expected["jetton_amount"],
-                                                    Address(wallet_address).to_str(is_user_friendly=False))):
-                continue
-            notifications.append(delivered)
-        except Exception:  # noqa: BLE001
-            continue
-    return _notification_received(notifications[0]) if len(notifications) == 1 else None
-
-
 # ============================== Разбор заказа ==============================
 
 def _strip(text: str) -> str:
@@ -1026,10 +711,9 @@ class AutoStarsService:
             try:
                 self.wallet = Wallet.from_mnemonic(config["ton_mnemonic"], self.tonapi)
                 self.wallet._min_seqno = self.storage.get_confirmed_seqno(self.wallet.address)
-                currency = payment_currency(config)
-                balance = self._get_payment_balance(currency)
+                balance = self.wallet.get_balance()
                 logger.info(f"{LOGGER_PREFIX} TON кошелёк подключён: {self.wallet.address} "
-                            f"(баланс {balance / currency_unit(currency)} {currency}).")
+                            f"(баланс {balance / ONE_TON} TON).")
             except Exception as e:  # noqa: BLE001
                 logger.error(f"{LOGGER_PREFIX} Не удалось подключить TON кошелёк: {e}")
         else:
@@ -1047,17 +731,6 @@ class AutoStarsService:
         for order in self.storage.get_unchecked_orders():
             threading.Thread(target=self._check_username, args=(order,), daemon=True).start()
         logger.info(f"{LOGGER_PREFIX} Сервис запущен.")
-
-    def _get_payment_balance(self, currency: str | None = None) -> int:
-        currency = currency or payment_currency(self.config)
-        if currency == "TON":
-            balance = self.wallet.get_balance()
-        elif currency == "USDT":
-            balance, _ = self.tonapi.get_usdt_balance(self.wallet.address)
-        else:
-            raise ValueError(f"Неподдерживаемая валюта оплаты: {currency}")
-        self._balance_cache = (currency, balance)
-        return balance
 
     # ---------- отправка сообщений ----------
 
@@ -1313,12 +986,12 @@ class AutoStarsService:
                         continue
                     if float(self.config.get("low_balance_threshold", 0)) > 0 or self._low_balance_paused:
                         try:
-                            bal = self._get_payment_balance()
+                            bal = self.wallet.get_balance()
                             if self._check_low_balance(bal):
                                 continue
                         except Exception as e:  # noqa: BLE001
                             logger.warning(f"{LOGGER_PREFIX} Не удалось проверить баланс: {e}")
-                            if self._low_balance_paused or payment_currency(self.config) == "USDT":
+                            if self._low_balance_paused:
                                 continue
                     orders = self.storage.get_ready_orders()
                     if not orders:
@@ -1326,7 +999,7 @@ class AutoStarsService:
                     for o in orders:
                         o["retries_left"] -= 1
                     self.storage.upsert(*orders)
-                    logger.info(f"{LOGGER_PREFIX} Оплата в {payment_currency(self.config)} по заказам: "
+                    logger.info(f"{LOGGER_PREFIX} Перевод TON по заказам: "
                                 f"{', '.join(o['order_id'] for o in orders)}.")
                     self._transfer_batch(orders)
             except Exception as e:  # noqa: BLE001
@@ -1337,24 +1010,9 @@ class AutoStarsService:
     def _transfer_batch(self, orders: list[dict]) -> None:
         if self.storage.get_pending_orders():
             return
-        currency = payment_currency(self.config)
-        jetton_balance, jetton_wallet = None, None
-        if currency == "USDT":
-            try:
-                jetton_balance, jetton_wallet = self.tonapi.get_usdt_balance(self.wallet.address)
-                self._balance_cache = (currency, jetton_balance)
-            except Exception as e:  # noqa: BLE001
-                logger.error(f"{LOGGER_PREFIX} Ошибка получения баланса USDT: {e}")
-                self._fail(orders, ERR_GET_BALANCE)
-                return
-            if not jetton_wallet or not jetton_balance:
-                for order in orders:
-                    order["retries_left"] = 0
-                self._fail(orders, ERR_NOT_ENOUGH_USDT)
-                return
         prepared = []
         for order in orders:
-            transfer = self._prepare_transfer(order, currency, jetton_wallet)
+            transfer = self._prepare_transfer(order)
             if transfer:
                 prepared.append((order, transfer))
         self.storage.upsert(*orders)
@@ -1366,33 +1024,24 @@ class AutoStarsService:
 
         try:
             balance = self.wallet.get_balance() - ONE_TON // 10  # резерв 0.1 TON
-            if currency == "TON":
-                self._balance_cache = (currency, balance + ONE_TON // 10)
         except Exception as e:  # noqa: BLE001
             logger.error(f"{LOGGER_PREFIX} Ошибка получения баланса: {e}")
             self._fail([o for o, _ in prepared], ERR_GET_BALANCE)
             return
 
-        prepared.sort(key=lambda p: p[1].get("jetton_amount", p[1]["amount"]))
-        fit, total, jetton_total = [], 0, 0
-        not_enough_ton, not_enough_usdt = [], []
+        prepared.sort(key=lambda p: p[1]["amount"])
+        fit, total = [], 0
         for order, transfer in prepared:
-            if currency == "USDT" and jetton_total + transfer["jetton_amount"] > jetton_balance:
-                not_enough_usdt.append(order)
-                continue
             if total + transfer["amount"] > balance:
-                not_enough_ton.append(order)
-                continue
+                break
             total += transfer["amount"]
-            jetton_total += transfer.get("jetton_amount", 0)
             fit.append((order, transfer))
 
-        for not_enough, error in ((not_enough_ton, ERR_NOT_ENOUGH_TON),
-                                  (not_enough_usdt, ERR_NOT_ENOUGH_USDT)):
+        not_enough = [o for (o, _) in prepared if (o, _) not in fit]
+        if not_enough:
             for o in not_enough:
                 o["retries_left"] = 0
-            if not_enough:
-                self._fail(not_enough, error)
+            self._fail(not_enough, ERR_NOT_ENOUGH_TON)
         if not fit:
             return
 
@@ -1417,14 +1066,7 @@ class AutoStarsService:
                 "amount": transfer["amount"],
                 "body_hash": transfer["body"].hash.hex(),
                 "request_id": transfer["request_id"],
-                "currency": currency,
             }
-            if currency == "USDT":
-                for field in ("jetton_query_id", "jetton_amount", "jetton_recipient"):
-                    order["expected_message"][field] = transfer[field]
-                if transfer.get("confirm_method"):
-                    order["expected_message"]["confirm_method"] = transfer["confirm_method"]
-                    order["expected_message"]["confirm_params"] = transfer["confirm_params"]
             order["status"] = ST_TRANSFERRING
             order["error"] = None
         # Write-ahead: если запись не удалась, send_boc никогда не вызывается.
@@ -1543,50 +1185,26 @@ class AutoStarsService:
         for message in outgoing:
             try:
                 if message.get("msg_type") == "int_msg" and message.get("bounced") is False:
-                    keys.append((_outgoing_key(message), message))
+                    keys.append(_outgoing_key(message))
             except Exception:  # noqa: BLE001 - некорректный BOC не подтверждает платёж
                 continue
-        trace = None
-        if any(o.get("expected_message", {}).get("currency") == "USDT" for o in pending):
-            try:
-                trace = self.tonapi.get_trace(tx["hash"])
-            except Exception as e:  # noqa: BLE001
-                logger.warning(f"{LOGGER_PREFIX} Пока не удалось проверить цепочку USDT: {e}")
-        completed, uncertain, awaiting = [], [], []
+        completed, uncertain = [], []
         for order in orders:
             expected = order.get("expected_message", {})
             try:
                 key = (Address(expected["address"]).to_str(is_user_friendly=False),
                        int(expected["amount"]), expected["body_hash"])
-                index = next((i for i, item in enumerate(keys) if item[0] == key), None)
-                message = keys.pop(index)[1] if index is not None else None
+                matched = key in keys
+                if matched:
+                    keys.remove(key)
             except Exception:  # noqa: BLE001
-                message = None
+                matched = False
             # Учитываем уже завершённые заказы, чтобы не использовать одно сообщение дважды.
             if order["payment_attempt"].get("state") != "PENDING":
                 continue
             order["payment_attempt"]["wallet_executed"] = True
             order["payment_attempt"]["transaction_hash"] = tx["hash"]
-            if message and expected.get("currency", "TON") == "USDT":
-                result = _verify_usdt_trace(trace, tx, message, expected, attempt["wallet_address"])
-                if result is None:
-                    awaiting.append(order)
-                    continue
-                if result is False:
-                    uncertain.append(order)
-                    continue
-                if expected.get("confirm_method"):
-                    try:
-                        if not self.fragment:
-                            raise ValueError("Fragment не подключён")
-                        self.fragment.confirm_stars_payment(
-                            expected["confirm_method"], expected["confirm_params"],
-                            order["payment_attempt"]["boc"], order["payment_attempt"]["tonconnect_account"])
-                    except Exception as e:  # noqa: BLE001
-                        logger.warning(f"{LOGGER_PREFIX} Fragment ещё не подтвердил заказ {order['order_id']}: {e}")
-                        awaiting.append(order)
-                        continue
-            if message:
+            if matched:
                 order["status"], order["error"] = ST_DONE, None
                 order["transaction_hash"] = tx["hash"]
                 order["payment_attempt"]["state"] = "CONFIRMED"
@@ -1595,85 +1213,47 @@ class AutoStarsService:
             else:
                 uncertain.append(order)
         # Подтверждение и seqno сохраняются атомарно до сообщений покупателю.
-        self.storage.upsert(*completed, *uncertain, *awaiting)
+        self.storage.upsert(*completed, *uncertain)
         if self.wallet and self.wallet.address == attempt["wallet_address"]:
             self.wallet.confirm_seqno(attempt)
         if completed:
-            logger.info(f"{LOGGER_PREFIX} Платежи подтверждены по заказам "
+            logger.info(f"{LOGGER_PREFIX} TON-платежи подтверждены по заказам "
                         f"{', '.join(o['order_id'] for o in completed)}. Хэш: {tx['hash']}.")
         for order in completed:
             self._on_success(order)
         if uncertain:
-            self._mark_for_review(uncertain, "Исходящий платёж или цепочка USDT не подтверждены.")
-        if awaiting and time.time() > attempt["valid_until"] + PAYMENT_REVIEW_GRACE_SEC:
-            self._mark_for_review(awaiting, "Перевод USDT или подтверждение Fragment пока не завершены.")
+            self._mark_for_review(uncertain, "Не найдены исходящие сообщения с ожидаемыми адресом, суммой и payload.")
 
-    def _prepare_transfer(self, order: dict, currency: str = "TON", jetton_wallet: str | None = None) -> dict | None:
-        stage = "Создание заявки в Fragment"
+    def _prepare_transfer(self, order: dict) -> dict | None:
         try:
-            req = self.fragment.init_buy_stars_request(order["recipient_id"], order["stars_amount"], currency)
-            stage = "Подготовка кошелька"
-            account = self.wallet.offline.tonconnect_account() if currency == "USDT" else None
-            stage = "Получение платёжных данных Fragment"
-            if account is None:
-                link = self.fragment.get_buy_stars_link(req["req_id"], self.config.get("show_sender", False))
-            else:
-                link = self.fragment.get_buy_stars_link(req["req_id"], self.config.get("show_sender", False), account)
-                stage = "Проверка платёжных данных"
-                sender = link["transaction"].get("from")
-                if sender and Address(sender).to_str(is_user_friendly=False) != Address(
-                    self.wallet.address
-                ).to_str(is_user_friendly=False):
-                    raise ValueError("Отправитель Fragment не совпадает с кошельком.")
-            stage = "Проверка платёжных данных"
+            req = self.fragment.init_buy_stars_request(order["recipient_id"], order["stars_amount"])
+            link = self.fragment.get_buy_stars_link(req["req_id"], self.config.get("show_sender", False))
             if len(link["transaction"]["messages"]) != 1:
                 raise FragmentError("getBuyStarsLink", "expected exactly one payment message")
             msg = link["transaction"]["messages"][0]
             if int(msg["amount"]) <= 0:
                 raise FragmentError("getBuyStarsLink", "payment amount must be positive")
-            order["ref"] = extract_ref(msg.get("payload", "")) if currency == "TON" else None
-            body = self._build_body(order, msg, currency)
-            result = {
+            order["ref"] = extract_ref(msg.get("payload", ""))
+            return {
                 "address": Address(msg["address"]).to_str(is_user_friendly=False),
                 "amount": int(msg["amount"]),
-                "body": body,
+                "body": self._build_body(order, msg),
                 "valid_until": int(link["transaction"]["validUntil"]),
                 "request_id": req["req_id"],
             }
-            if currency == "USDT":
-                if msg.get("stateInit") or msg.get("state_init"):
-                    raise ValueError("Fragment вернул неподдерживаемый stateInit для платежа USDT.")
-                if not jetton_wallet or result["address"] != Address(jetton_wallet).to_str(is_user_friendly=False):
-                    raise ValueError("Адрес USDT-кошелька не совпадает с кошельком владельца.")
-                query, amount, recipient, remaining = _jetton_fields(body, 0x0F8A7EA5)
-                remaining.load_address()  # response_destination
-                remaining.load_maybe_ref()  # custom_payload
-                if remaining.load_coins() <= 0:
-                    raise ValueError("В платеже USDT отсутствует комиссия для уведомления получателя.")
-                if remaining.load_bit():  # forward_payload: inline or reference
-                    remaining.load_ref()
-                result.update(jetton_query_id=query, jetton_amount=amount, jetton_recipient=recipient)
-                if link.get("confirm_method"):
-                    params = link.get("confirm_params") or {}
-                    if link["confirm_method"] != "confirmReq" or not isinstance(params, dict):
-                        raise ValueError("Fragment вернул неизвестные параметры подтверждения.")
-                    result.update(confirm_method=link["confirm_method"], confirm_params=params)
-            order.pop("payment_error_detail", None)
-            return result
         except Exception as e:  # noqa: BLE001
             logger.error(f"{LOGGER_PREFIX} Ошибка получения ссылки Fragment "
                          f"по заказу {order['order_id']}: {e}")
             order["status"], order["error"] = ST_ERROR, ERR_UNABLE_TO_FETCH_LINK
-            order["payment_error_detail"] = payment_error_detail(stage, e)
             return None
 
-    def _build_body(self, order: dict, msg: dict, currency: str = "TON"):
+    def _build_body(self, order: dict, msg: dict):
         # По умолчанию используем payload Fragment как есть (надёжнее всего).
-        if currency == "TON" and self.config.get("show_ad") and order.get("ref"):
+        if self.config.get("show_ad") and order.get("ref"):
             return begin_cell().store_uint(0, 32).store_snake_string(
                 f"{AD_TEXT}\n\n{order['ref']}"
             ).end_cell()
-        return Cell.one_from_boc(_decode_fragment_payload(msg["payload"]))
+        return Cell.one_from_boc(base64.b64decode(_pad_b64(msg["payload"])))
 
     def _fail(self, orders: list[dict], error: str) -> None:
         for order in orders:
@@ -1696,11 +1276,9 @@ class AutoStarsService:
         self._send(order, format_message(msgs.get("transaction_failed", ""), order))
         logger.error(f"{LOGGER_PREFIX} Заказ {order['order_id']} провалился: "
                      f"{ERROR_DESC.get(order['error'], order['error'])}.")
-        detail = order.get("payment_error_detail") if order.get("error") == ERR_UNABLE_TO_FETCH_LINK else None
         self._notify_admin(
             f"❌ <b>AutoStars: ошибка заказа {html.escape(order['order_id'])}</b>\n"
             f"{html.escape(ERROR_DESC.get(order['error'], order['error']))}"
-            + (f"\n\n<b>Причина:</b> {html.escape(detail)}" if detail else "")
         )
         if self.config.get("refund_on_error"):
             self._refund(order)
@@ -1727,31 +1305,29 @@ class AutoStarsService:
 
     # ---------- автовыключение при низком балансе ----------
 
-    def _check_low_balance(self, balance: int) -> bool:
+    def _check_low_balance(self, balance_nanoton: int) -> bool:
         """Возвращает True и приостанавливает цикл, если баланс ниже порога."""
         threshold = float(self.config.get("low_balance_threshold", 0))
-        currency = payment_currency(self.config)
-        unit = currency_unit(currency)
         if threshold <= 0:
             if self._low_balance_paused:
                 self._low_balance_paused = False
             return False
-        if balance < int(threshold * unit):
+        if balance_nanoton < int(threshold * ONE_TON):
             if not self._low_balance_paused:
                 self._low_balance_paused = True
                 logger.warning(
-                    f"{LOGGER_PREFIX} Низкий баланс: {balance / unit:.4f} {currency} "
-                    f"(порог {threshold} {currency}). Автовыдача приостановлена."
+                    f"{LOGGER_PREFIX} Низкий баланс: {balance_nanoton / ONE_TON:.4f} TON "
+                    f"(порог {threshold} TON). Автовыдача приостановлена."
                 )
-                self._notify_low_balance(balance, threshold)
+                self._notify_low_balance(balance_nanoton, threshold)
             return True
         if self._low_balance_paused:
             self._low_balance_paused = False
             logger.info(
-                f"{LOGGER_PREFIX} Баланс восстановлен: {balance / unit:.4f} {currency}. "
+                f"{LOGGER_PREFIX} Баланс восстановлен: {balance_nanoton / ONE_TON:.4f} TON. "
                 f"Автовыдача возобновлена."
             )
-            self._notify_balance_ok(balance)
+            self._notify_balance_ok(balance_nanoton)
         return False
 
     def _notify_low_balance(self, balance: int, threshold: float) -> None:
@@ -1759,13 +1335,12 @@ class AutoStarsService:
             return
         if not self._bot or not self._admin_chat_id:
             return
-        currency = payment_currency(self.config)
         try:
             self._bot.send_message(
                 self._admin_chat_id,
                 f"⚠️ <b>AutoStars: низкий баланс!</b>\n\n"
-                f"Текущий баланс: <b>{balance / currency_unit(currency):.4f} {currency}</b>\n"
-                f"Порог: <b>{threshold} {currency}</b>\n\n"
+                f"Текущий баланс: <b>{balance / ONE_TON:.4f} TON</b>\n"
+                f"Порог: <b>{threshold} TON</b>\n\n"
                 f"Автовыдача <b>приостановлена</b>. Пополните кошелёк — "
                 f"плагин возобновит работу автоматически."
             )
@@ -1777,12 +1352,11 @@ class AutoStarsService:
             return
         if not self._bot or not self._admin_chat_id:
             return
-        currency = payment_currency(self.config)
         try:
             self._bot.send_message(
                 self._admin_chat_id,
                 f"✅ <b>AutoStars: баланс восстановлен!</b>\n\n"
-                f"Текущий баланс: <b>{balance / currency_unit(currency):.4f} {currency}</b>\n\n"
+                f"Текущий баланс: <b>{balance / ONE_TON:.4f} TON</b>\n\n"
                 f"Автовыдача <b>возобновлена</b>."
             )
         except Exception as e:  # noqa: BLE001
@@ -1808,17 +1382,9 @@ class AutoStarsService:
             try:
                 self.wallet = Wallet.from_mnemonic(self.config["ton_mnemonic"], self.tonapi)
                 self.wallet._min_seqno = self.storage.get_confirmed_seqno(self.wallet.address)
-                self._balance_cache = None
-                currency = payment_currency(self.config)
-                lines.append(f"✅ Кошелёк: <code>{self.wallet.address}</code>")
-                try:
-                    balance = self._get_payment_balance(currency)
-                    lines.append(f"💰 Баланс: {balance / currency_unit(currency):.6f} {currency}")
-                except Exception as e:  # noqa: BLE001
-                    logger.warning(f"{LOGGER_PREFIX} Не удалось получить баланс {currency}: {e}")
-                    lines.append(f"⚠️ Не удалось получить баланс {currency}.")
-                if currency == "USDT":
-                    lines.append("ℹ️ Для комиссии сети также нужен TON.")
+                balance = self.wallet.get_balance()
+                lines.append(f"✅ Кошелёк: <code>{self.wallet.address}</code>\n"
+                             f"💰 Баланс: {balance / ONE_TON} TON")
             except Exception as e:  # noqa: BLE001
                 self.wallet = None
                 lines.append(f"❌ Ошибка кошелька: {e}")
@@ -1844,7 +1410,7 @@ def load_config() -> dict:
         cfg = json.load(f)
     # Дополняем недостающие ключи дефолтами.
     for k, v in DEFAULT_CONFIG.items():
-        cfg.setdefault(k, copy.deepcopy(v))
+        cfg.setdefault(k, v)
     for k, v in DEFAULT_CONFIG["messages"].items():
         cfg.setdefault("messages", {}).setdefault(k, v)
     return cfg
@@ -1921,8 +1487,6 @@ def register_settings(cardinal: "Cardinal", *args) -> None:
                  callback_data=f"asedit:ton_mnemonic:{offset}"))
         kb.add(B(f"🔑 tonapi токен: {is_set(cfg.get('ton_api_token'))}",
                  callback_data=f"asedit:ton_api_token:{offset}"))
-        currency = payment_currency(cfg)
-        kb.add(B(f"💱 Валюта оплаты: {currency}", callback_data=f"ascurrency:{offset}"))
         kb.add(B(f"👤 Показывать отправителя: {on_off(cfg.get('show_sender'))}",
                  callback_data=f"astgl:show_sender:{offset}"))
         kb.add(B(f"📢 Реклама в комментарии: {on_off(cfg.get('show_ad'))}",
@@ -1932,7 +1496,7 @@ def register_settings(cardinal: "Cardinal", *args) -> None:
         kb.add(B(f"⏱ Интервал цикла: {cfg.get('loop_interval_sec', 5)} сек",
                  callback_data=f"asedit:loop_interval_sec:{offset}"))
         lbt = cfg.get("low_balance_threshold", 0.0)
-        lbt_label = f"{lbt} {currency}" if lbt else "выкл"
+        lbt_label = f"{lbt} TON" if lbt else "выкл"
         kb.add(B(f"🪫 Мин. баланс: {lbt_label}",
                  callback_data=f"asedit:low_balance_threshold:{offset}"))
         kb.add(B(f"🔔 Уведомить о низком балансе: {on_off(cfg.get('low_balance_notify', True))}",
@@ -1947,9 +1511,7 @@ def register_settings(cardinal: "Cardinal", *args) -> None:
 
     def settings_text() -> str:
         cfg = _ensure_config()
-        currency = payment_currency(cfg)
         status = "не запущен"
-        balance_text = f"💰 Баланс {currency}: не проверен"
         if SERVICE is not None:
             fr = "✅" if SERVICE.fragment else "❌"
             wl = "✅" if SERVICE.wallet else "❌"
@@ -1957,19 +1519,14 @@ def register_settings(cardinal: "Cardinal", *args) -> None:
             pending = len(SERVICE.storage.get_pending_orders())
             payment_pause = f" · ⏳ ждём результат платежа ({pending} заказов)" if pending else ""
             status = f"Fragment {fr} · Кошелёк {wl}{pause}{payment_pause}"
-            cached = getattr(SERVICE, "_balance_cache", None)
-            if cached and cached[0] == currency:
-                balance_text = f"💰 Баланс {currency}: {cached[1] / currency_unit(currency):.6f} (последняя проверка)"
         elif not PYTONIQ_AVAILABLE:
             status = "❌ не установлен pytoniq (pip install pytoniq)"
         return (f"<b>⭐ AutoStars — настройки</b>\n\n"
                 f"<i>Состояние:</i> {status}\n\n"
-                f"{balance_text}\n\n"
                 f"Нажмите на пункт, чтобы изменить. Секретные значения "
                 f"(cookies, hash, сид-фраза) скрыты и показываются как «задано».\n"
                 f"После изменения ключей нажмите «♻️ Переподключить».\n"
-                f"Мин. баланс = 0 → автовыключение отключено. "
-                f"Для USDT нужен TON на комиссию.")
+                f"Мин. баланс = 0 → автовыключение отключено.")
 
     def render(c, offset: int) -> None:
         bot.edit_message_text(settings_text(), c.message.chat.id, c.message.id,
@@ -2014,37 +1571,6 @@ def register_settings(cardinal: "Cardinal", *args) -> None:
         render(c, int(offset))
         bot.answer_callback_query(c.id, "Сохранено.")
 
-    def toggle_currency(c) -> None:
-        offset = int(c.data.split(":")[1])
-        bot.answer_callback_query(c.id, "Меняю валюту…")
-        service = SERVICE
-
-        def worker():
-            cfg = _ensure_config()
-            try:
-                with service._provider_lock if service is not None else contextlib.nullcontext():
-                    previous = copy.deepcopy(cfg)
-                    currency = "USDT" if payment_currency(cfg) == "TON" else "TON"
-                    switch_payment_currency(cfg, currency)
-                    try:
-                        save_config(cfg)
-                    except Exception:
-                        cfg.clear()
-                        cfg.update(previous)
-                        raise
-                    if service is not None:
-                        service._low_balance_paused = False
-                        if service.wallet:
-                            service._get_payment_balance(currency)
-                render(c, offset)
-            except Exception as e:  # noqa: BLE001
-                logger.warning(f"{LOGGER_PREFIX} Не удалось сменить валюту или получить баланс: {e}")
-                render(c, offset)
-                bot.send_message(c.message.chat.id, "⚠️ Не удалось получить баланс или сохранить валюту. "
-                                 "Проверьте настройки и нажмите «Переподключить».")
-
-        threading.Thread(target=worker, daemon=True).start()
-
     def reload_cb(c) -> None:
         offset = int(c.data.split(":")[1])
         bot.answer_callback_query(c.id, "Переподключаю…")
@@ -2087,7 +1613,7 @@ def register_settings(cardinal: "Cardinal", *args) -> None:
             f"✏️ Отправьте новое значение для <b>{title}</b>.{shown}",
             reply_markup=K().add(B("❌ Отмена", callback_data=f"asopen:{offset}")))
         tg.set_state(c.message.chat.id, prompt.id, c.from_user.id, STATE_EDIT,
-                     {"key": key, "offset": offset, "currency": payment_currency(cfg)})
+                     {"key": key, "offset": offset})
         bot.answer_callback_query(c.id)
 
     def receive_value(m) -> None:
@@ -2100,7 +1626,6 @@ def register_settings(cardinal: "Cardinal", *args) -> None:
 
         value = (m.text or "").strip()
         cfg = _ensure_config()
-        saved = False
 
         if key.startswith("messages."):
             cfg.setdefault("messages", {})[key.split(".", 1)[1]] = value
@@ -2115,32 +1640,17 @@ def register_settings(cardinal: "Cardinal", *args) -> None:
         elif key == "low_balance_threshold":
             try:
                 val = float(value.replace(",", "."))
-                if not math.isfinite(val) or val < 0:
+                if val < 0:
                     raise ValueError
+                cfg[key] = val
             except ValueError:
                 bot.reply_to(m, "❌ Нужно число ≥ 0 (например: 1.5). 0 — отключить.",
                              reply_markup=K().add(B("◀️ К настройкам",
                                                     callback_data=f"asopen:{offset}")))
                 return
-            service = SERVICE
-            with service._provider_lock if service is not None else contextlib.nullcontext():
-                if data.get("currency", "TON") != payment_currency(cfg):
-                    bot.reply_to(m, "❌ Валюта изменилась. Задайте минимальный баланс заново.",
-                                 reply_markup=K().add(B("◀️ К настройкам",
-                                                        callback_data=f"asopen:{offset}")))
-                    return
-                previous = cfg.get(key, 0.0)
-                cfg[key] = val
-                try:
-                    save_config(cfg)
-                except Exception:
-                    cfg[key] = previous
-                    raise
-                saved = True
         else:
             cfg[key] = value
-        if not saved:
-            save_config(cfg)
+        save_config(cfg)
 
         back = K().add(B("◀️ К настройкам", callback_data=f"asopen:{offset}"))
         bot.reply_to(m, "✅ Сохранено.", reply_markup=back)
@@ -2160,7 +1670,6 @@ def register_settings(cardinal: "Cardinal", *args) -> None:
                    lambda c: c.data.startswith(f"{cbt_settings}:{UUID}") or c.data.startswith("asopen:"))
     tg.cbq_handler(open_messages, lambda c: c.data.startswith("asmsgs:"))
     tg.cbq_handler(toggle, lambda c: c.data.startswith("astgl:"))
-    tg.cbq_handler(toggle_currency, lambda c: c.data.startswith("ascurrency:"))
     tg.cbq_handler(reload_cb, lambda c: c.data.startswith("asreload:"))
     tg.cbq_handler(edit_value, lambda c: c.data.startswith("asedit:"))
     tg.msg_handler(receive_value,
