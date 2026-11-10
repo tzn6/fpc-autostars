@@ -60,7 +60,7 @@ except Exception as e:  # noqa: BLE001
 # ============================== МЕТА-ДАННЫЕ ПЛАГИНА ==============================
 
 NAME = "AutoStars"
-VERSION = "0.3.1"
+VERSION = "0.3.2"
 DESCRIPTION = (
     "Автовыдача Telegram Stars: покупка звёзд через Fragment и оплата с "
     "TON-кошелька W5. Требует: pip install pytoniq."
@@ -85,6 +85,8 @@ AD_TEXT = "Stars sent automatically by AutoStars plugin for FunPayCardinal."
 PAYMENT_REVIEW_GRACE_SEC = 120
 MIN_PAYMENT_TTL_SEC = 15
 PAYMENT_REBROADCAST_SEC = 30
+FUNPAY_STATUS_RETRY_SEC = 30
+FUNPAY_STATUS_MAX_AGE_SEC = 10
 
 DEFAULT_CONFIG = {
     "fragment_cookies": "",
@@ -139,6 +141,7 @@ ERR_TRANSFER = "TRANSFER_ERROR"
 ERR_TIMEOUT = "TRANSACTION_TIMEOUT_ERROR"
 ERR_TRANSACTION_FAILED = "TRANSACTION_FAILED"
 ERR_PAYMENT_UNCERTAIN = "PAYMENT_RESULT_UNCERTAIN"
+ERR_FUNPAY_INACTIVE = "FUNPAY_ORDER_INACTIVE"
 
 ERROR_DESC = {
     ERR_INVALID_USERNAME: "Невалидный Telegram юзернейм",
@@ -154,6 +157,7 @@ ERROR_DESC = {
     ERR_TIMEOUT: "Таймаут ожидания подтверждения транзакции",
     ERR_TRANSACTION_FAILED: "TON-транзакция завершилась без отправки платежей",
     ERR_PAYMENT_UNCERTAIN: "Результат платежа пока не подтверждён; повтор и возврат заблокированы",
+    ERR_FUNPAY_INACTIVE: "Заказ больше не ожидает выполнения на FunPay",
 }
 
 CHECK_USERNAME_ERRORS = {
@@ -528,7 +532,10 @@ class Storage:
         with self._lock:
             result = []
             for o in self.orders.values():
-                if o.get("payment_attempt", {}).get("state") == "PENDING":
+                if o.get("payment_attempt", {}).get("state") in ("PENDING", "CONFIRMED"):
+                    continue
+                retry_at = o.get("funpay_check_retry_at", 0)
+                if not isinstance(retry_at, (int, float)) or retry_at > time.time():
                     continue
                 if o["status"] == ST_READY or (o["status"] == ST_ERROR and o["retries_left"] > 0):
                     result.append(copy.deepcopy(o))
@@ -969,6 +976,72 @@ class AutoStarsService:
 
     # ---------- цикл перевода ----------
 
+    def _funpay_order_status(self, order: dict) -> str | None:
+        """Запрашивает актуальный заказ; неизвестный результат не разрешает оплату."""
+        try:
+            current = self.cardinal.account.get_order(order["order_id"])
+            if str(getattr(current, "id", "")).upper() != str(order["order_id"]).upper():
+                raise ValueError("order id mismatch")
+            for expected, actual in (
+                (getattr(self.cardinal.account, "id", None), getattr(current, "seller_id", None)),
+                (order.get("buyer_id"), getattr(current, "buyer_id", None)),
+            ):
+                if expected is not None and actual is not None and str(expected) != str(actual):
+                    raise ValueError("order participant mismatch")
+            status = getattr(getattr(current, "status", None), "name", None)
+            if status not in {"PAID", "REFUNDED", "PARTIALLY_REFUNDED", "CLOSED", "UNPAID"}:
+                raise ValueError("unknown order status")
+            return status
+        except Exception as e:  # noqa: BLE001 - сетевой сбой не разрешает выдачу
+            logger.warning(f"{LOGGER_PREFIX} Не удалось проверить заказ {order['order_id']} на FunPay "
+                           f"({type(e).__name__}).")
+            return None
+
+    def _ensure_funpay_paid(self, order: dict, retry_consumed: bool = False) -> bool:
+        """Для новой оплаты разрешён только свежий статус PAID от FunPay."""
+        if order.get("payment_attempt", {}).get("state") in ("PENDING", "CONFIRMED"):
+            return False
+        status = self._funpay_order_status(order)
+        if status == "PAID":
+            order.pop("funpay_check_retry_at", None)
+            order.pop("funpay_check_notified", None)
+            return True
+        if retry_consumed:
+            order["retries_left"] = max(order["retries_left"] + 1, 1)
+        if status is None:
+            order["funpay_check_retry_at"] = int(time.time()) + FUNPAY_STATUS_RETRY_SEC
+            self.storage.upsert(order)
+            if not order.get("funpay_check_notified"):
+                notified = self._notify_admin(
+                    "⚠️ <b>AutoStars: не удалось проверить заказ на FunPay</b>\n"
+                    f"Заказ: <code>{html.escape(order['order_id'])}</code>\n"
+                    "Выдача приостановлена до успешной проверки и будет повторена автоматически."
+                )
+                if notified:
+                    order["funpay_check_notified"] = True
+                    self.storage.upsert(order)
+            return False
+
+        order.pop("funpay_check_retry_at", None)
+        order.pop("funpay_check_notified", None)
+        order["funpay_status"] = status
+        if status == "REFUNDED":
+            order["status"], order["error"] = ST_REFUNDED, None
+            reason = "деньги возвращены"
+        else:
+            order["status"], order["error"] = ST_NEEDS_REVIEW, ERR_FUNPAY_INACTIVE
+            reason = {"PARTIALLY_REFUNDED": "деньги возвращены частично",
+                      "CLOSED": "заказ закрыт", "UNPAID": "заказ не оплачен"}[status]
+            order["payment_review_reason"] = f"Статус FunPay: {reason}."
+        self.storage.upsert(order)
+        logger.info(f"{LOGGER_PREFIX} Заказ {order['order_id']} пропущен: {reason}.")
+        self._notify_admin(
+            "ℹ️ <b>AutoStars: заказ пропущен</b>\n"
+            f"Заказ: <code>{html.escape(order['order_id'])}</code>\n"
+            f"На FunPay {reason}. Автовыдача не выполнялась."
+        )
+        return False
+
     def _loop(self) -> None:
         while not self._stop.is_set():
             interval = max(2, int(self.config.get("loop_interval_sec", 5)))
@@ -993,14 +1066,9 @@ class AutoStarsService:
                             logger.warning(f"{LOGGER_PREFIX} Не удалось проверить баланс: {e}")
                             if self._low_balance_paused:
                                 continue
-                    orders = self.storage.get_ready_orders()
+                    orders = self.storage.get_ready_orders(limit=getattr(self, "_safe_batch_limit", 65))
                     if not orders:
                         continue
-                    for o in orders:
-                        o["retries_left"] -= 1
-                    self.storage.upsert(*orders)
-                    logger.info(f"{LOGGER_PREFIX} Перевод TON по заказам: "
-                                f"{', '.join(o['order_id'] for o in orders)}.")
                     self._transfer_batch(orders)
             except Exception as e:  # noqa: BLE001
                 logger.error(f"{LOGGER_PREFIX} Ошибка в цикле перевода: {e}")
@@ -1010,6 +1078,22 @@ class AutoStarsService:
     def _transfer_batch(self, orders: list[dict]) -> None:
         if self.storage.get_pending_orders():
             return
+        eligible = []
+        for order in orders:
+            saved = self.storage.get(order["order_id"])
+            if (not saved or saved.get("payment_attempt", {}).get("state") in ("PENDING", "CONFIRMED")
+                    or saved.get("status") not in (ST_READY, ST_ERROR)):
+                continue
+            if self._ensure_funpay_paid(order):
+                eligible.append(order)
+        orders = eligible
+        if not orders:
+            return
+        for order in orders:
+            order["retries_left"] -= 1
+        self.storage.upsert(*orders)
+        logger.info(f"{LOGGER_PREFIX} Перевод TON по заказам: "
+                    f"{', '.join(o['order_id'] for o in orders)}.")
         prepared = []
         for order in orders:
             transfer = self._prepare_transfer(order)
@@ -1053,6 +1137,31 @@ class AutoStarsService:
             self._fail(fit_orders, ERR_TRANSFER)
             return
 
+        # Проверяем ещё раз после подготовки кошелька, непосредственно перед записью и отправкой.
+        # Подписанный пакет нельзя разделить, поэтому при изменении одного заказа не отправляем весь BOC.
+        checked, failed, first_check_at = [], False, None
+        for order in fit_orders:
+            if self._ensure_funpay_paid(order, retry_consumed=True):
+                checked.append(order)
+                if first_check_at is None:
+                    first_check_at = time.monotonic()
+            else:
+                failed = True
+        checks_too_old = first_check_at is not None and time.monotonic() - first_check_at > FUNPAY_STATUS_MAX_AGE_SEC
+        quote_expired = attempt["valid_until"] <= time.time() + MIN_PAYMENT_TTL_SEC
+        if failed or checks_too_old or quote_expired:
+            for order in checked:
+                order["retries_left"] += 1
+            if checked:
+                self.storage.upsert(*checked)
+            if checks_too_old:
+                # Медленные ответы не должны сделать первую проверку устаревшей.
+                self._safe_batch_limit = max(1, len(fit_orders) // 2)
+                logger.warning(f"{LOGGER_PREFIX} Проверка FunPay заняла слишком много времени; уменьшаем пакет.")
+            if quote_expired:
+                logger.warning(f"{LOGGER_PREFIX} Истёк срок платёжных данных; платёж не отправлен.")
+            return
+
         for order, transfer in fit:
             previous = order.get("payment_attempt")
             if previous:
@@ -1071,6 +1180,11 @@ class AutoStarsService:
             order["error"] = None
         # Write-ahead: если запись не удалась, send_boc никогда не вызывается.
         self.storage.upsert(*fit_orders)
+        if (time.monotonic() - first_check_at > FUNPAY_STATUS_MAX_AGE_SEC
+                or time.time() >= attempt["valid_until"] - MIN_PAYMENT_TTL_SEC):
+            self._mark_for_review(fit_orders, "Проверка FunPay или платёжные данные устарели до отправки. "
+                                             "Сохранённая транзакция будет проверена повторно.")
+            return
         try:
             self.wallet.broadcast_transfer(attempt)
         except Exception as e:  # noqa: BLE001
@@ -1135,14 +1249,35 @@ class AutoStarsService:
                 if self.wallet and self.wallet.address == wallet_address and (
                     time.time() < attempt["valid_until"] - MIN_PAYMENT_TTL_SEC
                     and time.time() - attempt.get("last_broadcast_at", 0) >= PAYMENT_REBROADCAST_SEC
+                    and time.time() - attempt.get("last_funpay_recheck_at", 0) >= FUNPAY_STATUS_RETRY_SEC
                 ):
+                    statuses, first_check_at = [], None
                     for order in pending:
-                        order["payment_attempt"]["last_broadcast_at"] = int(time.time())
-                    self.storage.upsert(*pending)
-                    try:
-                        self.wallet.broadcast_transfer(attempt)
-                    except Exception as e:  # noqa: BLE001
-                        logger.warning(f"{LOGGER_PREFIX} Повторная отправка прежнего BOC {message_hash}: {e}")
+                        statuses.append(self._funpay_order_status(order))
+                        if first_check_at is None:
+                            first_check_at = time.monotonic()
+                    checks_fresh = (first_check_at is not None and
+                                    time.monotonic() - first_check_at <= FUNPAY_STATUS_MAX_AGE_SEC)
+                    all_paid = checks_fresh and all(status == "PAID" for status in statuses)
+                    if all_paid and time.time() < attempt["valid_until"] - MIN_PAYMENT_TTL_SEC:
+                        for order in pending:
+                            order["payment_attempt"]["last_broadcast_at"] = int(time.time())
+                        self.storage.upsert(*pending)
+                        if (time.monotonic() - first_check_at <= FUNPAY_STATUS_MAX_AGE_SEC
+                                and time.time() < attempt["valid_until"] - MIN_PAYMENT_TTL_SEC):
+                            try:
+                                self.wallet.broadcast_transfer(attempt)
+                            except Exception as e:  # noqa: BLE001
+                                logger.warning(f"{LOGGER_PREFIX} Повторная отправка прежнего BOC {message_hash}: {e}")
+                        else:
+                            self._mark_for_review(pending, "Проверка FunPay или платёжные данные устарели до отправки.")
+                    elif not all_paid:
+                        for order in pending:
+                            order["payment_attempt"]["last_funpay_recheck_at"] = int(time.time())
+                        self._mark_for_review(
+                            pending, "Повторная отправка сохранённого платежа остановлена: "
+                                     "статус хотя бы одного заказа на FunPay не подтверждён как оплаченный."
+                        )
                 if time.time() > attempt["valid_until"] + PAYMENT_REVIEW_GRACE_SEC:
                     self._mark_for_review(pending, "Транзакция не найдена после истечения срока платежа.")
                 continue
@@ -1272,6 +1407,9 @@ class AutoStarsService:
         self._send(order, format_message(msgs.get("transaction_completed", ""), order))
 
     def _on_fail(self, order: dict) -> None:
+        # Ошибка подготовки не должна приводить к возврату или сообщению по уже закрытому заказу.
+        if not self._ensure_funpay_paid(order, retry_consumed=True):
+            return
         msgs = self.config.get("messages", {})
         self._send(order, format_message(msgs.get("transaction_failed", ""), order))
         logger.error(f"{LOGGER_PREFIX} Заказ {order['order_id']} провалился: "
