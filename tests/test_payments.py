@@ -11,6 +11,7 @@ import tempfile
 import threading
 import types
 import unittest
+from enum import Enum
 from unittest import mock
 
 
@@ -162,14 +163,29 @@ class FakeFragment:
         }}
 
 
+class FakeOrderStatus(Enum):
+    PAID = 0
+    CLOSED = 1
+    REFUNDED = 2
+    PARTIALLY_REFUNDED = 3
+    UNPAID = 5
+
+
 class FakeCardinal:
     def __init__(self):
         self.messages = []
         self.refunds = []
         self.notifications = []
-        self.account = types.SimpleNamespace(id=999, refund=self.refunds.append)
+        self.statuses = {}
+        self.account = types.SimpleNamespace(id=999, refund=self.refunds.append, get_order=self.get_order)
         self.telegram = types.SimpleNamespace(bot=types.SimpleNamespace(
             send_message=lambda *args: self.notifications.append(args)))
+
+    def get_order(self, order_id):
+        status = self.statuses.get(order_id, FakeOrderStatus.PAID)
+        if isinstance(status, Exception):
+            raise status
+        return types.SimpleNamespace(id=order_id, status=status, seller_id=999, buyer_id=2)
 
     def send_message(self, chat_id, text, buyer_name):
         self.messages.append((chat_id, text))
@@ -248,6 +264,236 @@ class PaymentTests(unittest.TestCase):
         self.s.storage.upsert(order())
         self.run_cycles()
         return self.s.storage.get("O1")
+
+    def test_stale_new_order_event_refunded_while_bot_was_off_does_not_buy(self):
+        self.s.cardinal.statuses["O1"] = FakeOrderStatus.REFUNDED
+        old_event = types.SimpleNamespace(
+            id="O1", status=FakeOrderStatus.PAID, buyer_id=2, buyer_username="buyer",
+            chat_id="O1", amount=1, description="Telegram, 50 Stars, По username, @validuser")
+        with mock.patch.object(p.threading, "Thread", ImmediateThread):
+            self.s.handle_new_order(old_event)
+        self.assertEqual(self.s.storage.get("O1")["status"], p.ST_READY)
+        self.run_cycles(3)
+        self.assertEqual(self.s.storage.get("O1")["status"], p.ST_REFUNDED)
+        self.assertEqual(self.s.fragment.calls, [])
+        self.assertEqual(self.s.tonapi.broadcasts, [])
+        self.assertEqual(self.s.cardinal.refunds, [])
+        self.assertEqual(self.s.cardinal.messages, [])
+
+    def test_only_paid_funpay_orders_are_eligible(self):
+        for status in (FakeOrderStatus.CLOSED, FakeOrderStatus.UNPAID, FakeOrderStatus.PARTIALLY_REFUNDED):
+            with self.subTest(status=status):
+                self.s = self.service()
+                self.s.storage.orders = {}
+                self.s.cardinal.statuses["O1"] = status
+                self.s.storage.upsert(order())
+                self.run_cycles(2)
+                saved = self.s.storage.get("O1")
+                self.assertEqual(saved["status"], p.ST_NEEDS_REVIEW)
+                self.assertEqual(saved["error"], p.ERR_FUNPAY_INACTIVE)
+                self.assertEqual(saved["funpay_status"], status.name)
+                self.assertEqual(self.s.storage.get_pending_orders(), [])
+                self.assertEqual(self.s.fragment.calls, [])
+                self.assertEqual(self.s.tonapi.broadcasts, [])
+                self.assertEqual(self.s.cardinal.refunds, [])
+                self.assertEqual(self.s.cardinal.messages, [])
+
+    def test_funpay_outage_defers_without_consuming_retries_or_refunding(self):
+        self.s.storage.upsert(order())
+        self.s.cardinal.statuses["O1"] = TimeoutError("sensitive request data")
+        self.run_cycles(3)
+        saved = self.s.storage.get("O1")
+        self.assertEqual(saved["status"], p.ST_READY)
+        self.assertEqual(saved["retries_left"], 3)
+        self.assertEqual(len(self.s.cardinal.notifications), 1)
+        self.assertNotIn("sensitive request data", str(self.s.cardinal.notifications))
+        self.assertEqual(self.s.fragment.calls, [])
+        self.assertEqual(self.s.tonapi.broadcasts, [])
+        self.assertEqual(self.s.cardinal.refunds, [])
+        self.assertEqual(self.s.cardinal.messages, [])
+        self.s.cardinal.statuses["O1"] = FakeOrderStatus.PAID
+        with mock.patch.object(p.time, "time", return_value=saved["funpay_check_retry_at"] + 1):
+            self.run_cycles()
+        self.assertEqual(self.s.storage.get("O1")["status"], p.ST_DONE)
+        self.assertEqual(len(self.s.tonapi.broadcasts), 1)
+        self.assertEqual(len(self.s.cardinal.messages), 1)
+
+    def test_unknown_status_and_mismatched_order_are_not_paid(self):
+        cases = [
+            types.SimpleNamespace(id="O1", status=None, seller_id=999, buyer_id=2),
+            types.SimpleNamespace(id="O1", status="PAID", seller_id=999, buyer_id=2),
+            types.SimpleNamespace(id="OTHER", status=FakeOrderStatus.PAID, seller_id=999, buyer_id=2),
+            types.SimpleNamespace(id="O1", status=FakeOrderStatus.PAID, seller_id=777, buyer_id=2),
+            types.SimpleNamespace(id="O1", status=FakeOrderStatus.PAID, seller_id=999, buyer_id=3),
+            None,
+        ]
+        for current in cases:
+            with self.subTest(current=current):
+                self.s = self.service()
+                self.s.storage.orders = {}
+                self.s.storage.upsert(order())
+                self.s.cardinal.account.get_order = mock.Mock(return_value=current)
+                self.run_cycles()
+                self.assertEqual(self.s.storage.get("O1")["status"], p.ST_READY)
+                self.assertEqual(self.s.storage.get("O1")["retries_left"], 3)
+                self.assertEqual(self.s.fragment.calls, [])
+                self.assertEqual(self.s.tonapi.broadcasts, [])
+                self.assertEqual(self.s.cardinal.refunds, [])
+
+    def test_refund_after_preparation_cancels_signed_batch(self):
+        self.s.storage.upsert(order("O1"), order("O2"))
+        calls = {"O1": 0, "O2": 0}
+        original = self.s.cardinal.get_order
+
+        def changed(order_id):
+            calls[order_id] += 1
+            if order_id == "O2" and calls[order_id] >= 2:
+                self.s.cardinal.statuses["O2"] = FakeOrderStatus.REFUNDED
+            return original(order_id)
+
+        self.s.cardinal.account.get_order = changed
+        self.run_cycles()
+        self.assertEqual(self.s.storage.get("O2")["status"], p.ST_REFUNDED)
+        self.assertEqual(self.s.storage.get("O1")["status"], p.ST_READY)
+        self.assertEqual(self.s.storage.get("O1")["retries_left"], 3)
+        self.assertEqual(self.s.tonapi.broadcasts, [])
+        self.assertEqual(self.s.cardinal.messages, [])
+        self.assertEqual(self.s.cardinal.refunds, [])
+        self.run_cycles()
+        self.assertEqual(self.s.storage.get("O1")["status"], p.ST_DONE)
+        self.assertEqual(self.s.storage.get("O2")["status"], p.ST_REFUNDED)
+        self.assertEqual(len(self.s.tonapi.broadcasts), 1)
+        self.assertEqual([m[0] for m in self.s.cardinal.messages], ["O1"])
+
+    def test_temporary_outage_after_preparation_does_not_spend_or_consume_retry(self):
+        self.s.storage.upsert(order())
+        original = self.s.cardinal.get_order
+        calls = 0
+
+        def intermittent(order_id):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise TimeoutError("FunPay unavailable")
+            return original(order_id)
+
+        self.s.cardinal.account.get_order = intermittent
+        self.run_cycles()
+        saved = self.s.storage.get("O1")
+        self.assertEqual(saved["status"], p.ST_READY)
+        self.assertEqual(saved["retries_left"], 3)
+        self.assertEqual(self.s.tonapi.broadcasts, [])
+        self.assertEqual(self.s.cardinal.refunds, [])
+        with mock.patch.object(p.time, "time", return_value=saved["funpay_check_retry_at"] + 1):
+            self.run_cycles()
+        self.assertEqual(self.s.storage.get("O1")["status"], p.ST_DONE)
+        self.assertEqual(len(self.s.tonapi.broadcasts), 1)
+
+    def test_slow_batch_checks_retry_in_smaller_batches_without_sending_stale_quote(self):
+        self.s.storage.upsert(order("O1"), order("O2"))
+        with mock.patch.object(p.time, "monotonic", side_effect=[100, 111]):
+            self.run_cycles()
+        self.assertEqual(self.s.tonapi.broadcasts, [])
+        self.assertEqual(self.s._safe_batch_limit, 1)
+        self.assertEqual(self.s.storage.get("O1")["retries_left"], 3)
+        self.assertEqual(self.s.storage.get("O2")["retries_left"], 3)
+        self.run_cycles()
+        self.assertEqual(self.s.storage.get("O1")["status"], p.ST_DONE)
+        self.assertEqual(self.s.storage.get("O2")["status"], p.ST_READY)
+
+    def test_status_must_still_be_fresh_after_journal_write(self):
+        self.s.storage.upsert(order())
+        with mock.patch.object(p.time, "monotonic", side_effect=[100, 100, 111]):
+            self.run_cycles()
+        saved = self.s.storage.get("O1")
+        self.assertEqual(saved["status"], p.ST_NEEDS_REVIEW)
+        self.assertEqual(saved["payment_attempt"]["state"], "PENDING")
+        self.assertEqual(self.s.tonapi.broadcasts, [])
+        self.assertEqual(self.s.cardinal.messages, [])
+        self.assertEqual(self.s.cardinal.refunds, [])
+
+    def test_refund_during_last_fragment_error_does_not_refund_or_message_again(self):
+        current = order()
+        current["retries_left"] = 1
+        self.s.storage.upsert(current)
+        self.s.fragment.broken = True
+        original = self.s.cardinal.get_order
+        calls = 0
+
+        def changed(order_id):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                self.s.cardinal.statuses[order_id] = FakeOrderStatus.REFUNDED
+            return original(order_id)
+
+        self.s.cardinal.account.get_order = changed
+        self.run_cycles()
+        self.assertEqual(self.s.storage.get("O1")["status"], p.ST_REFUNDED)
+        self.assertEqual(self.s.cardinal.refunds, [])
+        self.assertEqual(self.s.cardinal.messages, [])
+        self.assertEqual(self.s.tonapi.broadcasts, [])
+
+    def test_refunded_saved_attempt_is_never_rebroadcast(self):
+        def crash():
+            raise SystemExit("process death before broadcast")
+        self.s.tonapi.before_broadcast = crash
+        self.s.storage.upsert(order())
+        with self.assertRaises(SystemExit):
+            self.run_cycles()
+        saved = self.s.storage.get("O1")
+        self.s.tonapi.before_broadcast = None
+        restarted = self.service(self.s.tonapi)
+        restarted.cardinal.statuses["O1"] = FakeOrderStatus.REFUNDED
+        with mock.patch.object(p.time, "time", return_value=saved["payment_attempt"]["created_at"] + 40):
+            self.run_cycles(2, restarted)
+        result = restarted.storage.get("O1")
+        self.assertEqual(result["status"], p.ST_NEEDS_REVIEW)
+        self.assertEqual(result["payment_attempt"]["state"], "PENDING")
+        self.assertEqual(self.s.tonapi.broadcasts, [])
+        self.assertEqual(restarted.cardinal.refunds, [])
+        self.assertEqual(restarted.cardinal.messages, [])
+
+    def test_one_refunded_order_blocks_rebroadcast_of_entire_saved_batch(self):
+        self.s.tonapi.before_broadcast = lambda: (_ for _ in ()).throw(SystemExit("stop"))
+        self.s.storage.upsert(order("O1"), order("O2"))
+        with self.assertRaises(SystemExit):
+            self.run_cycles()
+        saved = self.s.storage.get("O1")
+        self.s.tonapi.before_broadcast = None
+        restarted = self.service(self.s.tonapi)
+        restarted.cardinal.statuses["O2"] = FakeOrderStatus.REFUNDED
+        with mock.patch.object(p.time, "time", return_value=saved["payment_attempt"]["created_at"] + 40):
+            self.run_cycles(service=restarted)
+        self.assertEqual(self.s.tonapi.broadcasts, [])
+        self.assertEqual(restarted.storage.get("O1")["status"], p.ST_NEEDS_REVIEW)
+        self.assertEqual(restarted.storage.get("O2")["status"], p.ST_NEEDS_REVIEW)
+        self.assertEqual(restarted.cardinal.messages, [])
+
+    def test_funpay_unavailable_blocks_rebroadcast_of_saved_attempt(self):
+        def crash():
+            raise SystemExit("stop before broadcast")
+        self.s.tonapi.before_broadcast = crash
+        self.s.storage.upsert(order())
+        with self.assertRaises(SystemExit):
+            self.run_cycles()
+        saved = self.s.storage.get("O1")
+        self.s.tonapi.before_broadcast = None
+        restarted = self.service(self.s.tonapi)
+        restarted.cardinal.statuses["O1"] = TimeoutError("offline")
+        restarted.cardinal.account.get_order = mock.Mock(wraps=restarted.cardinal.get_order)
+        with mock.patch.object(p.time, "time", return_value=saved["payment_attempt"]["created_at"] + 40):
+            self.run_cycles(3, restarted)
+        self.assertEqual(restarted.storage.get("O1")["status"], p.ST_NEEDS_REVIEW)
+        self.assertEqual(restarted.storage.get("O1")["payment_attempt"]["state"], "PENDING")
+        self.assertEqual(restarted.cardinal.account.get_order.call_count, 1)
+        self.assertEqual(self.s.tonapi.broadcasts, [])
+        self.assertEqual(restarted.cardinal.refunds, [])
+        restarted.cardinal.statuses["O1"] = FakeOrderStatus.PAID
+        with mock.patch.object(p.time, "time", return_value=saved["payment_attempt"]["created_at"] + 71):
+            self.run_cycles(2, restarted)
+        self.assertEqual(restarted.storage.get("O1")["status"], p.ST_DONE)
+        self.assertEqual(restarted.tonapi.broadcasts, [saved["payment_attempt"]["boc"]])
 
     def test_journal_is_saved_before_broadcast(self):
         def check():
